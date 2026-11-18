@@ -13,7 +13,7 @@
 #     pennylane_version
 #
 # Behavior:
-#   - 10 qubits by default
+#   - 4 qubits by default (configurable)
 #   - exactly 4 quantum layers
 #   - train if checkpoint does not exist
 #   - load saved checkpoint if available
@@ -32,6 +32,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from PIL import Image
 from typing import Iterable
 
 import numpy as np
@@ -87,11 +88,11 @@ FLUSH_EVERY = int(
 )
 
 DNN_QUBITS = int(
-    os.getenv("DNN_QUBITS", "1")
+    os.getenv("DNN_QUBITS", "4")
 )
 
 CNN_QUBITS = int(
-    os.getenv("CNN_QUBITS", "1")
+    os.getenv("CNN_QUBITS", "4")
 )
 
 N_LAYERS = 4
@@ -137,9 +138,9 @@ def resolve_device():
 # PennyLane default.qubit is CPU-based. Keep PyTorch on CPU by default.
 DEVICE = resolve_device()
 
-DATA_ROOT = Path("../classical_data")
+DATA_ROOT = Path(os.getenv("DATA_ROOT", "./data"))
 OUTPUT_ROOT = Path.cwd() / "test_results"
-CHECKPOINT_DIR = Path.cwd() / "quantum_checkpoints"
+CHECKPOINT_DIR = Path(os.getenv("CHECKPOINT_DIR", str(Path.cwd() / "quantum_checkpoints")))
 
 OUTPUT_ROOT.mkdir(
     parents=True,
@@ -152,26 +153,104 @@ CHECKPOINT_DIR.mkdir(
 )
 
 
+# Class mappings match torchvision ImageFolder's sorted class IDs.
 DATASET_CONFIGS = {
-    "MNIST": {
-        "dataset_class": datasets.MNIST,
-        "mean": (0.1307,),
-        "std": (0.3081,),
-        "checkpoint_prefix": "mnist",
-    },
-    "FashionMNIST": {
-        "dataset_class": datasets.FashionMNIST,
-        "mean": (0.2860,),
-        "std": (0.3530,),
-        "checkpoint_prefix": "fashionmnist",
-    },
-    "KMNIST": {
-        "dataset_class": datasets.KMNIST,
-        "mean": (0.1918,),
-        "std": (0.3483,),
-        "checkpoint_prefix": "kmnist",
-    },
+    "MNIST": {"dataset_class": datasets.MNIST,
+              "mean": (0.1307,), "std": (0.3081,),
+              "checkpoint_prefix": "mnist", "num_classes": 10,
+              "image_size": 28, "channels": 1},
+    "FashionMNIST": {"dataset_class": datasets.FashionMNIST,
+              "mean": (0.2860,), "std": (0.3530,),
+              "checkpoint_prefix": "fashionmnist", "num_classes": 10,
+              "image_size": 28, "channels": 1},
+    "KMNIST": {"dataset_class": datasets.KMNIST,
+              "mean": (0.1918,), "std": (0.3483,),
+              "checkpoint_prefix": "kmnist", "num_classes": 10,
+              "image_size": 28, "channels": 1},
+    "CIFAR100": {"dataset_class": datasets.CIFAR100,
+              "mean": (0.5071, 0.4867, 0.4408),
+              "std": (0.2675, 0.2565, 0.2761),
+              "checkpoint_prefix": "cifar100", "num_classes": 100,
+              "image_size": 32, "channels": 3},
+    "TinyImageNet200": {"dataset_class": None,
+              "mean": (0.4802, 0.4481, 0.3975),
+              "std": (0.2302, 0.2265, 0.2262),
+              "checkpoint_prefix": "tinyimagenet200", "num_classes": 200,
+              "image_size": 64, "channels": 3},
 }
+
+# A new checkpoint filename prevents loading weights learned with the original
+# degenerate 1-qubit min/max preprocessing.
+PREPROCESSING_VERSION = 2
+
+class TinyImageNetValidation(torch.utils.data.Dataset):
+    """Original Tiny ImageNet 200 validation layout (with annotations)."""
+    def __init__(self, root, transform=None, class_to_idx=None):
+        root = Path(root)
+        self.transform = transform
+        wnids_file = root / "wnids.txt"
+        if not wnids_file.is_file():
+            raise FileNotFoundError(f"Missing Tiny ImageNet wnids.txt: {wnids_file}")
+        ids = sorted(x.strip() for x in wnids_file.read_text().splitlines() if x.strip())
+        if len(ids) != 200:
+            raise ValueError(f"Expected 200 Tiny ImageNet classes, found {len(ids)}")
+        self.class_to_idx = class_to_idx or {x: i for i, x in enumerate(ids)}
+        ann = root / "val" / "val_annotations.txt"
+        self.samples = []
+        if ann.is_file():
+            for line in ann.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    file_name, label = parts[:2]
+                    image_path = root / "val" / "images" / file_name
+                    if label in self.class_to_idx and image_path.is_file():
+                        self.samples.append((image_path, self.class_to_idx[label]))
+        else:
+            for label, idx in self.class_to_idx.items():
+                for path in sorted((root / "val" / label).rglob("*")):
+                    if path.suffix.lower() in (".jpeg", ".jpg", ".png"):
+                        self.samples.append((path, idx))
+        if not self.samples:
+            raise FileNotFoundError(f"No labeled validation images found in {root / 'val'}")
+        self.samples.sort(key=lambda v: str(v[0]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        with Image.open(path) as im:
+            image = im.convert("RGB")
+            return (self.transform(image) if self.transform else image), label
+
+
+def load_dataset_pair(dataset_name, config):
+    """Train split for fitting; unseen official test/val split for telemetry."""
+    shape_transform = transforms.Compose([
+        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.ToTensor(),
+    ])
+    if dataset_name != "TinyImageNet200":
+        ds = config["dataset_class"]
+        train = ds(root=str(DATA_ROOT), train=True, download=True,
+                   transform=shape_transform)
+        test = ds(root=str(DATA_ROOT), train=False, download=True,
+                  transform=shape_transform)
+        return train, test
+
+    root = Path(os.getenv("TINY_IMAGENET_ROOT", str(DATA_ROOT / "tiny-imagenet-200")))
+    train_root = root / "train"
+    if not train_root.is_dir():
+        raise FileNotFoundError(
+            f"Missing Tiny ImageNet training directory: {train_root}. "
+            "Download and extract tiny-imagenet-200 manually."
+        )
+    train = datasets.ImageFolder(str(train_root), transform=shape_transform)
+    if len(train.classes) != 200:
+        raise ValueError(f"Tiny ImageNet train contains {len(train.classes)} classes, expected 200")
+    test = TinyImageNetValidation(root, transform=shape_transform,
+                                  class_to_idx=train.class_to_idx)
+    return train, test
 
 
 QUANTUM_MODELS = (
@@ -996,69 +1075,21 @@ REFERENCE_COLUMNS = [
 # 8. IMAGE PREPROCESSING
 # ============================================================
 
-def preprocess_image(
-    image_tensor,
-    n_qubits,
-    mean,
-    std,
-):
+def preprocess_image(image_tensor, n_qubits, mean, std):
+    """Compress normalized image to bounded rotation angles.
 
-    normalize = transforms.Normalize(
-        mean,
-        std,
-    )
-
-    image = normalize(
-        image_tensor
-    )
-
-    flat = (
-        image
-        .reshape(-1)
-        .float()
-    )
-
-    chunks = torch.tensor_split(
-        flat,
-        n_qubits,
-    )
-
-    compressed = torch.stack([
-        chunk.mean()
-        for chunk in chunks
-    ])
-
-    min_value = (
-        compressed.min()
-    )
-
-    max_value = (
-        compressed.max()
-    )
-
-    difference = (
-        max_value - min_value
-    )
-
-    if float(
-        difference
-    ) > 1e-8:
-
-        compressed = (
-            (compressed - min_value)
-            / difference
-            * (2.0 * torch.pi)
-            - torch.pi
-        )
-
-    else:
-        compressed = (
-            torch.zeros_like(
-                compressed
-            )
-        )
-
-    return compressed
+    tanh preserves magnitude for n_qubits=1; unlike per-image min/max,
+    a single-qubit input is not identically zero. Applies equally to RGB.
+    """
+    if n_qubits < 1:
+        raise ValueError("n_qubits must be >= 1")
+    image = transforms.Normalize(mean, std)(image_tensor.float())
+    flat = image.reshape(-1)
+    if n_qubits > flat.numel():
+        raise ValueError(f"n_qubits={n_qubits} exceeds pixels={flat.numel()}")
+    chunks = torch.tensor_split(flat, n_qubits)
+    compressed = torch.stack([chunk.mean() for chunk in chunks])
+    return torch.pi * torch.tanh(compressed)
 
 
 # ============================================================
@@ -1161,18 +1192,10 @@ def build_dnn_4layer_qnode(
             )
 
         if n_qubits > 1:
-            for q in range(
-                n_qubits
-            ):
-                qml.CNOT(
-                    wires=[
-                        q,
-                        (
-                            q + 1
-                        )
-                        % n_qubits,
-                    ]
-                )
+            for q in range(n_qubits - 1):
+                qml.CNOT(wires=[q, q + 1])
+            if n_qubits > 2:
+                qml.CNOT(wires=[n_qubits - 1, 0])
 
         # ------------------------
         # Layer 3
@@ -1387,18 +1410,10 @@ def build_cnn_4layer_qnode(
             )
 
         if n_qubits > 1:
-            for q in range(
-                n_qubits
-            ):
-                qml.CNOT(
-                    wires=[
-                        q,
-                        (
-                            q + 1
-                        )
-                        % n_qubits,
-                    ]
-                )
+            for q in range(n_qubits - 1):
+                qml.CNOT(wires=[q, q + 1])
+            if n_qubits > 2:
+                qml.CNOT(wires=[n_qubits - 1, 0])
 
         # ------------------------
         # Layer 4
@@ -1606,7 +1621,7 @@ def get_checkpoint_path(
             f"{dataset_name.lower()}_"
             f"{model_name.lower()}_"
             f"{n_qubits}qubit_"
-            f"4layer.pth"
+            f"4layer_preproc{PREPROCESSING_VERSION}.pth"
         )
     )
 
@@ -1647,6 +1662,8 @@ def save_checkpoint(
             str(
                 model.device_name
             ),
+
+        "preprocessing_version": PREPROCESSING_VERSION,
 
         "state_dict":
             model.state_dict(),
@@ -1692,6 +1709,9 @@ def load_checkpoint(
         map_location="cpu",
         weights_only=False,
     )
+
+    if checkpoint.get("preprocessing_version") != PREPROCESSING_VERSION:
+        raise ValueError(f"Checkpoint {path} uses incompatible preprocessing")
 
     model = (
         Quantum4LayerClassifier(
@@ -1816,6 +1836,9 @@ def make_train_val_loaders(
             train_dataset
         ),
     )
+
+    if total < 2:
+        raise ValueError("TRAIN_SAMPLES must be >= 2 for disjoint train/validation splits")
 
     rng = (
         np.random
@@ -2117,6 +2140,7 @@ def get_or_train_model(
     train_dataset,
     mean,
     std,
+    n_classes,
 ):
 
     n_qubits = (
@@ -2145,10 +2169,13 @@ def get_or_train_model(
             )
         )
 
-        return (
-            model,
-            checkpoint_path,
-        )
+        if model.n_classes != n_classes or model.model_type != model_name:
+            raise ValueError(
+                f"Incompatible checkpoint {checkpoint_path}: "
+                f"{model.n_classes} classes / {model.model_type}; expected {n_classes} / {model_name}. "
+                "Set FORCE_RETRAIN=1 to replace it."
+            )
+        return model, checkpoint_path
 
     model = (
         Quantum4LayerClassifier(
@@ -2161,7 +2188,7 @@ def get_or_train_model(
             ),
 
             n_classes=(
-                N_CLASSES
+                n_classes
             ),
 
             device_name=(
@@ -2550,6 +2577,7 @@ def build_row(
     checkpoint_path,
     n_qubits,
     fidelity=None,
+    input_pixels=784,
 ):
 
     (
@@ -2581,7 +2609,7 @@ def build_row(
     )
 
     # Same proxy as uploaded code.
-    input_tokens = 784
+    input_tokens = int(input_pixels)
     output_tokens = 1
 
     total_tokens = (
@@ -2989,7 +3017,7 @@ def get_output_path(
             f"quantum_dnn_cnn_dataset_"
             f"{DEVICE_SHORT}_"
             f"{dataset_name.lower()}_"
-            f"{model_name.lower()}.csv"
+            f"{model_name.lower()}_preproc{PREPROCESSING_VERSION}.csv"
         )
     )
 
@@ -3262,6 +3290,7 @@ def collect_for_model(
     std,
     num_samples,
     flush_every,
+    input_pixels=784,
 ):
 
     print(
@@ -3457,6 +3486,7 @@ def collect_for_model(
 
             fidelity=
                 None,
+            input_pixels=input_pixels,
         )
 
         rows.append(
@@ -3520,182 +3550,55 @@ def collect_for_model(
 # ============================================================
 
 def main():
+    selected = [name.strip() for name in os.getenv(
+        "DATASETS", "MNIST,FashionMNIST,KMNIST,CIFAR100,TinyImageNet200"
+    ).split(",") if name.strip()]
+    invalid = [x for x in selected if x not in DATASET_CONFIGS]
+    if invalid:
+        raise ValueError(f"Unknown datasets: {invalid}. Available: {list(DATASET_CONFIGS)}")
 
-    print(
-        "=" * 72
-    )
+    print("=" * 72)
+    print("FOUR-LAYER QUANTUM CNN/DNN SIMULATOR TELEMETRY")
+    print("Datasets:", selected)
+    print(f"Qubits: CNN={CNN_QUBITS}, DNN={DNN_QUBITS}; layers={N_LAYERS}")
+    print(f"Train samples={TRAIN_SAMPLES}, epochs={TRAIN_EPOCHS}; test samples={NUM_TEST_SAMPLES}")
+    print("Device:", DEVICE, " PennyLane:", PENNYLANE_DEVICE)
+    print("Preprocessing version:", PREPROCESSING_VERSION)
 
-    print(
-        "4-LAYER QUANTUM CNN/DNN "
-        "WITH MATCHED TELEMETRY"
-    )
-
-    print(
-        "=" * 72
-    )
-
-    print(
-        "quantum_computing: True"
-    )
-
-    print(
-        f"DNN qubits       : "
-        f"{DNN_QUBITS}"
-    )
-
-    print(
-        f"CNN qubits       : "
-        f"{CNN_QUBITS}"
-    )
-
-    print(
-        f"Quantum layers   : "
-        f"{N_LAYERS}"
-    )
-
-    print(
-        f"Training epochs  : "
-        f"{TRAIN_EPOCHS}"
-    )
-
-    print(
-        f"Training samples : "
-        f"{TRAIN_SAMPLES}"
-    )
-
-    print(
-        f"Testing samples  : "
-        f"{NUM_TEST_SAMPLES}"
-    )
-
-    print(
-        f"PennyLane device : "
-        f"{PENNYLANE_DEVICE}"
-    )
-
-    print(
-        f"Telemetry columns: "
-        f"{len(REFERENCE_COLUMNS)}"
-    )
-
-    for (
-        dataset_name,
-        config,
-    ) in DATASET_CONFIGS.items():
-
-        print(
-            "\n"
-            + "=" * 72
+    if DEVICE.type != "cpu" and PENNYLANE_DEVICE == "default.qubit":
+        raise RuntimeError(
+            "default.qubit runs on CPU. Set DEVICE_MODE=cpu for consistent "
+            "PyTorch/PennyLane tensors and valid CPU-side telemetry."
         )
 
-        print(
-            f"Dataset: "
-            f"{dataset_name}"
-        )
+    for dataset_name in selected:
+        config = DATASET_CONFIGS[dataset_name]
+        print(f"\n{'=' * 72}\nDataset: {dataset_name} ({config['num_classes']} classes)\n{'=' * 72}")
+        train_dataset, test_dataset = load_dataset_pair(dataset_name, config)
 
-        print(
-            "=" * 72
-        )
-
-        dataset_class = (
-            config[
-                "dataset_class"
-            ]
-        )
-
-        train_dataset = (
-            dataset_class(
-                root=str(
-                    DATA_ROOT
-                ),
-                train=True,
-                download=True,
-                transform=
-                    transforms.ToTensor(),
+        for model_name in QUANTUM_MODELS:
+            model, checkpoint_path = get_or_train_model(
+                model_name=model_name,
+                dataset_name=dataset_name,
+                train_dataset=train_dataset,
+                mean=config["mean"],
+                std=config["std"],
+                n_classes=config["num_classes"],
             )
-        )
-
-        test_dataset = (
-            dataset_class(
-                root=str(
-                    DATA_ROOT
-                ),
-                train=False,
-                download=True,
-                transform=
-                    transforms.ToTensor(),
-            )
-        )
-
-        for model_name in (
-            QUANTUM_MODELS
-        ):
-
-            (
-                model,
-                checkpoint_path,
-            ) = get_or_train_model(
-                model_name=
-                    model_name,
-
-                dataset_name=
-                    dataset_name,
-
-                train_dataset=
-                    train_dataset,
-
-                mean=
-                    config[
-                        "mean"
-                    ],
-
-                std=
-                    config[
-                        "std"
-                    ],
-            )
-
-            print(
-                f"Checkpoint: "
-                f"{checkpoint_path}"
-            )
-
             collect_for_model(
-                base_dataset=
-                    test_dataset,
-
-                model=
-                    model,
-
-                checkpoint_path=
-                    checkpoint_path,
-
-                model_name=
-                    model_name,
-
-                dataset_name=
-                    dataset_name,
-
-                mean=
-                    config[
-                        "mean"
-                    ],
-
-                std=
-                    config[
-                        "std"
-                    ],
-
-                num_samples=
-                    NUM_TEST_SAMPLES,
-
-                flush_every=
-                    FLUSH_EVERY,
+                base_dataset=test_dataset,
+                model=model,
+                checkpoint_path=checkpoint_path,
+                model_name=model_name,
+                dataset_name=dataset_name,
+                mean=config["mean"],
+                std=config["std"],
+                num_samples=NUM_TEST_SAMPLES,
+                flush_every=FLUSH_EVERY,
+                input_pixels=config["channels"] * config["image_size"] ** 2,
             )
-
-    print(
-        "\nDone."
-    )
+            del model
+    print("\nDone.")
 
 
 if __name__ == "__main__":

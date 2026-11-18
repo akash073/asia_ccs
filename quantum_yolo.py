@@ -1,2316 +1,219 @@
-# ============================================================
+"""Hybrid YOLO26n classification + PennyLane 4-layer VQC.
+Supports MNIST, FashionMNIST, KMNIST, CIFAR100 and TinyImageNet200.
+Auto-trains missing dataset-specific checkpoints; evaluates official held-out splits.
+Keeps original unified telemetry schema and resumes incomplete CSVs.
 
-# 1-QUBIT HYBRID YOLO CLASSIFIER
-
-# MNIST / FashionMNIST / KMNIST
-
-#
-
-# Behavior:
-
-#   1. For each dataset, look for a saved hybrid YOLO checkpoint.
-
-#   2. If the checkpoint exists, load it.
-
-#   3. If it does not exist, build YOLO26n-CLS with a 10-qubit
-
-#      PennyLane classification head, train for 10 epochs, and save it.
-
-#   4. Evaluate the saved/loaded model on the test set.
-
-#
-
-# IMPORTANT:
-
-# This is a REAL hybrid quantum-classical YOLO classifier.
-
-# It is different from the uploaded QYOLO paper, which is
-
-# "quantum-inspired" and does not use physical/simulated qubits.
-
-#
-
-# Install:
-
-#   pip install torch torchvision ultralytics pennylane \\
-
-#               pennylane-lightning scikit-learn tqdm
-
-#
-
-# Run:
-
-#   python yolo_10qubit_train_or_load.py
-
-#
-
-# Optional environment variables:
-
-#   DEVICE_MODE=cpu
-
-#   TRAIN_BATCH_SIZE=8
-
-#   TEST_BATCH_SIZE=16
-
-#   TRAIN_SAMPLES=0        # 0 = use all training samples
-
-#   TEST_SAMPLES=10000     # 0 = use all test samples
-
-#   FORCE_RETRAIN=0
-
-#   PENNYLANE_DEVICE=default.qubit
-
-# ============================================================
-
-
-
+Quantum circuit is simulated on a classical CPU (not a physical QPU).
+"""
 from __future__ import annotations
-
-
-
-import os
-import hashlib
-import platform
-import socket
-import sys
-import time
-
-import random
-
+import os, sys, time, random, hashlib, platform, socket
 from pathlib import Path
-
-
-
+from PIL import Image
 import numpy as np
-
-import pennylane as qml
-
-import torch
-
-import torch.nn as nn
-import torch.nn.functional as F
 import pandas as pd
 import psutil
-
-from sklearn.metrics import (
-
-    accuracy_score,
-
-    precision_score,
-
-    recall_score,
-
-    f1_score,
-
-)
-
-from torch.utils.data import DataLoader, Subset
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pennylane as qml
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
-
 from tqdm.auto import tqdm
-
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from ultralytics import YOLO
 
-
-
-
-
-# ============================================================
-
-# CONFIGURATION
-
-# ============================================================
-
-
-
-BASE_DIR = Path("../classical_data")
-
-CHECKPOINT_DIR = Path("./quantum_checkpoints")
-
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-
-SEED = 42
-
-random.seed(SEED)
-
-np.random.seed(SEED)
-
-torch.manual_seed(SEED)
-
-
-
-EPOCHS = int(
-
-    os.getenv("TRAIN_EPOCHS", "10")
-
-)
-
-IMG_SIZE = 64
-
-
-
-N_QUBITS = 1
-
-N_Q_LAYERS = 4
-
-N_CLASSES = 10
-
-
-
-LEARNING_RATE = 1e-3
-
-WEIGHT_DECAY = 5e-4
-
-
-
-TRAIN_BATCH_SIZE = int(
-
-    os.getenv("TRAIN_BATCH_SIZE", "16")
-
-)
-
-
-
-TEST_BATCH_SIZE = int(
-
-    os.getenv("TEST_BATCH_SIZE", "16")
-
-)
-
-
-
-# 0 means use the full dataset.
-
-TRAIN_SAMPLES = int(
-
-    os.getenv("TRAIN_SAMPLES", "0")
-
-)
-
-
-
-TEST_SAMPLES = int(
-
-    os.getenv("NUM_TEST_SAMPLES", "10")
-
-)
-
-
-
-FORCE_RETRAIN = (
-
-    os.getenv("FORCE_RETRAIN", "0").strip() == "1"
-
-)
-
-
-
-PENNYLANE_DEVICE = os.getenv(
-
-    "PENNYLANE_DEVICE",
-
-    "default.qubit",
-
-)
-
-
-
-DEVICE_MODE = os.getenv(
-
-    "DEVICE_MODE",
-
-    "cpu",
-
-).lower()
-
-
-
-DEVICE = torch.device("cpu")
-
-
-
-
-
-DATASET_CONFIGS = {
-
-    "MNIST": {
-
-        "dataset_class": datasets.MNIST,
-
-        "key": "mnist",
-
-    },
-
-    "FashionMNIST": {
-
-        "dataset_class": datasets.FashionMNIST,
-
-        "key": "fashionmnist",
-
-    },
-
-    "KMNIST": {
-
-        "dataset_class": datasets.KMNIST,
-
-        "key": "kmnist",
-
-    },
-
+SEED=int(os.getenv('RANDOM_SEED','42'))
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+DATA_ROOT=Path(os.getenv('DATA_ROOT','../classical_data'))
+TINY_ROOT=Path(os.getenv('TINY_IMAGENET_ROOT',str(DATA_ROOT/'tiny-imagenet-200')))
+CHECKPOINT_DIR=Path(os.getenv('CHECKPOINT_DIR','./quantum_checkpoints'))
+CHECKPOINT_DIR.mkdir(parents=True,exist_ok=True)
+EPOCHS=int(os.getenv('TRAIN_EPOCHS','10'))
+TRAIN_SAMPLES=int(os.getenv('TRAIN_SAMPLES','2000'))  # 0 means all
+NUM_TEST_SAMPLES=int(os.getenv('NUM_TEST_SAMPLES','10'))  # 0 means all
+TRAIN_BATCH_SIZE=int(os.getenv('TRAIN_BATCH_SIZE','8'))
+NUM_WORKERS=int(os.getenv('NUM_WORKERS','0'))
+LR=float(os.getenv('LEARNING_RATE','0.001'))
+WEIGHT_DECAY=float(os.getenv('WEIGHT_DECAY','0.0005'))
+IMG_SIZE=int(os.getenv('IMG_SIZE','64'))
+N_QUBITS=int(os.getenv('N_QUBITS','4'))
+N_Q_LAYERS=4
+ACTIVE_CLASSES=10
+PENNYLANE_DEVICE=os.getenv('PENNYLANE_DEVICE','default.qubit')
+FORCE_RETRAIN=os.getenv('FORCE_RETRAIN','0')=='1'
+DEVICE=torch.device('cpu')  # default.qubit + torch interface are CPU based; stable telemetry
+SELECTED_DATASETS=[x.strip() for x in os.getenv('DATASETS','MNIST,FashionMNIST,KMNIST,CIFAR100,TinyImageNet200').split(',') if x.strip()]
+DATASET_CONFIGS={
+ 'MNIST':(datasets.MNIST,'mnist',10),
+ 'FashionMNIST':(datasets.FashionMNIST,'fashionmnist',10),
+ 'KMNIST':(datasets.KMNIST,'kmnist',10),
+ 'CIFAR100':(datasets.CIFAR100,'cifar100',100),
+ 'TinyImageNet200':(None,'tinyimagenet200',200),
 }
-
-
-
-
-
-# ============================================================
-
-# IMAGE PREPROCESSING
-
-# ============================================================
-
-
-
-# YOLO classification expects a 3-channel image.
-
-# MNIST-family datasets are grayscale, so replicate to RGB.
-
-IMAGE_TRANSFORM = transforms.Compose([
-
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-
-    transforms.Grayscale(num_output_channels=3),
-
-    transforms.ToTensor(),
-
-])
-
-
-
-
-
-# ============================================================
-
-# 1-QUBIT QUANTUM CLASSIFICATION HEAD
-
-# ============================================================
-
-
-
-def build_quantum_circuit(
-
-    n_qubits: int = N_QUBITS,
-
-    n_layers: int = N_Q_LAYERS,
-
-    device_name: str = PENNYLANE_DEVICE,
-
-):
-
-    """
-
-    Variational quantum circuit.
-
-
-
-    Input:
-
-        x       -> n_qubits encoded angles
-
-        weights -> trainable rotations
-
-
-
-    Output:
-
-        one Pauli-Z expectation value per qubit
-
-
-
-    Since N_QUBITS = 1 and MNIST-family datasets have 10 classes,
-
-    the ten expectation values are used as ten class features.
-
-    """
-
-
-
-    dev = qml.device(
-
-        device_name,
-
-        wires=n_qubits,
-
-    )
-
-
-
-    @qml.qnode(
-
-        dev,
-
-        interface="torch",
-
-        diff_method="best",
-
-    )
-
-    def circuit(x, weights):
-
-
-
-        # -------------------------------
-
-        # Angle encoding
-
-        # -------------------------------
-
-        for q in range(n_qubits):
-
-            qml.RY(
-
-                x[q],
-
-                wires=q,
-
-            )
-
-
-
-            qml.RZ(
-
-                x[q],
-
-                wires=q,
-
-            )
-
-
-
-        # -------------------------------
-
-        # Trainable variational layers
-
-        # -------------------------------
-
-        for layer in range(n_layers):
-
-
-
-            for q in range(n_qubits):
-
-                qml.Rot(
-
-                    weights[layer, q, 0],
-
-                    weights[layer, q, 1],
-
-                    weights[layer, q, 2],
-
-                    wires=q,
-
-                )
-
-
-
-            # Ring entanglement
-
-            if n_qubits > 1:
-
-                for q in range(n_qubits):
-
-                    qml.CNOT(
-
-                        wires=[
-
-                            q,
-
-                            (q + 1) % n_qubits,
-
-                        ]
-
-                    )
-
-
-
-        # 1 expectation value
-
-        return [
-
-            qml.expval(
-
-                qml.PauliZ(q)
-
-            )
-
-            for q in range(n_qubits)
-
-        ]
-
-
-
-    return circuit
-
-
-
-
+assert N_QUBITS>=1 and TRAIN_BATCH_SIZE>=1 and IMG_SIZE>=32
+assert EPOCHS>=1 and NUM_TEST_SAMPLES>=0 and TRAIN_SAMPLES>=0
+if not set(SELECTED_DATASETS).issubset(DATASET_CONFIGS):
+ raise ValueError(f'Invalid datasets: {SELECTED_DATASETS}')
+
+class TinyImageNetDataset(Dataset):
+ def __init__(self, split, transform):
+  wnids_file=TINY_ROOT/'wnids.txt'
+  if not wnids_file.is_file(): raise FileNotFoundError(f'Missing {wnids_file}')
+  wnids=sorted(x.strip() for x in wnids_file.read_text().splitlines() if x.strip())
+  if len(wnids)!=200: raise ValueError('Expected exactly 200 Tiny ImageNet WNIDs')
+  lut={w:i for i,w in enumerate(wnids)}
+  self.samples=[]; self.transform=transform
+  if split=='train':
+   for w in wnids:
+    folder=TINY_ROOT/'train'/w/'images'
+    for p in sorted(folder.glob('*')):
+     if p.suffix.lower() in ('.jpg','.jpeg','.png'):
+      self.samples.append((p,lut[w]))
+  elif split=='test':
+   ann=TINY_ROOT/'val'/'val_annotations.txt'
+   if not ann.is_file(): raise FileNotFoundError(f'Missing {ann}')
+   for line in ann.read_text().splitlines():
+    fields=line.split()
+    if len(fields)>=2 and fields[1] in lut:
+     p=TINY_ROOT/'val'/'images'/fields[0]
+     if p.is_file(): self.samples.append((p,lut[fields[1]]))
+  else: raise ValueError(split)
+  if not self.samples: raise FileNotFoundError(f'No Tiny ImageNet images for {split}')
+ def __len__(self): return len(self.samples)
+ def __getitem__(self, idx):
+  p,y=self.samples[idx]
+  with Image.open(p) as im: x=self.transform(im.convert('RGB'))
+  return x,y
+
+def get_dataset(name, train):
+ cfg=DATASET_CONFIGS[name]
+ transform=transforms.Compose([transforms.Resize((IMG_SIZE,IMG_SIZE)),transforms.Lambda(lambda im: im.convert('RGB')),transforms.ToTensor()])
+ if name=='TinyImageNet200': return TinyImageNetDataset('train' if train else 'test',transform)
+ return cfg[0](root=str(DATA_ROOT),train=train,download=True,transform=transform)
+
+def make_loaders(name):
+ all_train=get_dataset(name,True)
+ if TRAIN_SAMPLES and TRAIN_SAMPLES<len(all_train):
+  rng=np.random.default_rng(SEED)
+  idx=rng.choice(len(all_train),size=TRAIN_SAMPLES,replace=False).tolist()
+  all_train=Subset(all_train,idx)
+ n=len(all_train)
+ if n<3: raise ValueError('Need at least 3 training images')
+ n_val=max(1,round(n*0.1))
+ train,val=torch.utils.data.random_split(all_train,[n-n_val,n_val],generator=torch.Generator().manual_seed(SEED))
+ test=get_dataset(name,False)
+ if NUM_TEST_SAMPLES: test=Subset(test,range(min(NUM_TEST_SAMPLES,len(test))))
+ kw=dict(batch_size=TRAIN_BATCH_SIZE,num_workers=NUM_WORKERS)
+ return (DataLoader(train,shuffle=True,**kw),DataLoader(val,shuffle=False,**kw),
+         DataLoader(test,shuffle=False,**kw))
+
+# Each qnode is executed sample-by-sample, with four trainable layers.
+def make_qnode(n_qubits):
+ dev=qml.device(PENNYLANE_DEVICE,wires=n_qubits)
+ @qml.qnode(dev,interface='torch',diff_method='best')
+ def circuit(x,weights):
+  for wire in range(n_qubits):
+   qml.RY(x[wire],wires=wire)
+   qml.RZ(x[wire],wires=wire)
+  for layer in range(N_Q_LAYERS):
+   for wire in range(n_qubits):
+    qml.Rot(*weights[layer,wire],wires=wire)
+   if n_qubits>1:
+    # Neighbor chain, no duplicate reverse CNOT for the two-qubit case.
+    for wire in range(n_qubits-1):
+     qml.CNOT(wires=[wire,wire+1])
+  return [qml.expval(qml.PauliZ(wire)) for wire in range(n_qubits)]
+ return circuit
 
 class QuantumYOLOHead(nn.Module):
-
-    """
-
-    Replaces YOLO's final classical Linear classifier.
-
-
-
-    Pipeline:
-
-
-
-        YOLO feature vector
-
-              |
-
-              v
-
-        Linear(in_features -> 1)
-
-              |
-
-            tanh*pi
-
-              |
-
-              v
-
-         1-qubit VQC
-
-              |
-
-              v
-
-        1 expectation value
-
-              |
-
-              v
-
-        Linear(1 -> 10)
-
-              |
-
-              v
-
-        10 class logits
-
-    """
-
-
-
-    def __init__(
-
-        self,
-
-        in_features: int,
-
-        n_qubits: int = N_QUBITS,
-
-        n_layers: int = N_Q_LAYERS,
-
-    ):
-
-        super().__init__()
-
-
-
-        self.in_features = int(in_features)
-
-        self.n_qubits = int(n_qubits)
-
-        self.n_layers = int(n_layers)
-
-
-
-        # Compress YOLO's high-dimensional feature vector
-
-        # to one angle per qubit.
-
-        self.feature_to_qubits = nn.Linear(
-
-            self.in_features,
-
-            self.n_qubits,
-
-        )
-
-
-
-        # Trainable VQC parameters.
-
-        self.q_weights = nn.Parameter(
-
-            0.01 * torch.randn(
-
-                self.n_layers,
-
-                self.n_qubits,
-
-                3,
-
-            )
-
-        )
-
-
-
-        self.qnode = build_quantum_circuit(
-
-            n_qubits=self.n_qubits,
-
-            n_layers=self.n_layers,
-
-            device_name=PENNYLANE_DEVICE,
-
-        )
-
-
-
-        # IMPORTANT: the circuit returns n_qubits quantum features,
-
-        # but MNIST/FashionMNIST/KMNIST always have 10 classes.
-
-        # This layer maps 1 quantum feature -> 10 class logits when
-
-        # N_QUBITS = 1.
-
-        self.classifier = nn.Linear(
-
-            self.n_qubits,
-
-            N_CLASSES,
-
-        )
-
-
-
-    def _forward_single(
-
-        self,
-
-        features: torch.Tensor,
-
-    ) -> torch.Tensor:
-
-
-
-        # Compress YOLO features to exactly 1 quantum input angle.
-
-        angles = self.feature_to_qubits(
-
-            features
-
-        )
-
-
-
-        # Bound encoding angles.
-
-        angles = (
-
-            torch.tanh(angles)
-
-            * torch.pi
-
-        )
-
-
-
-        q_out = self.qnode(
-
-            angles,
-
-            self.q_weights,
-
-        )
-
-
-
-        # PennyLane can return a tuple/list of scalar tensors.
-
-        if isinstance(q_out, torch.Tensor):
-
-            q_features = q_out
-
-        else:
-
-            q_features = torch.stack(
-
-                list(q_out)
-
-            )
-
-
-
-        q_features = q_features.to(
-
-            dtype=torch.float32
-
-        )
-
-
-
-        logits = self.classifier(
-
-            q_features
-
-        )
-
-
-
-        return logits
-
-
-
-    def forward(
-
-        self,
-
-        x: torch.Tensor,
-
-    ) -> torch.Tensor:
-
-
-
-        # YOLO classification head passes shape:
-
-        #     (batch, in_features)
-
-
-
-        if x.ndim == 1:
-
-            return self._forward_single(
-
-                x
-
-            ).unsqueeze(0)
-
-
-
-        # PennyLane simulation is evaluated sample-by-sample.
-
-        outputs = [
-
-            self._forward_single(
-
-                sample
-
-            )
-
-            for sample in x
-
-        ]
-
-
-
-        return torch.stack(
-
-            outputs,
-
-            dim=0,
-
-        )
-
-
-
-
-
-# ============================================================
-
-# FIND / REPLACE YOLO FINAL LINEAR CLASSIFIER
-
-# ============================================================
-
-
-
-def find_last_linear(
-
-    module: nn.Module,
-
-):
-
-    """
-
-    Return:
-
-        parent_module,
-
-        child_name,
-
-        linear_module
-
-
-
-    for the last nn.Linear layer in the model.
-
-    """
-
-
-
-    last = None
-
-
-
-    for full_name, child in module.named_modules():
-
-        if isinstance(
-
-            child,
-
-            nn.Linear,
-
-        ):
-
-            last = (
-
-                full_name,
-
-                child,
-
-            )
-
-
-
-    if last is None:
-
-        raise RuntimeError(
-
-            "Could not find a final nn.Linear "
-
-            "layer in the YOLO classification model."
-
-        )
-
-
-
-    full_name, linear = last
-
-
-
-    parts = full_name.split(".")
-
-
-
-    parent = module
-
-
-
-    for part in parts[:-1]:
-
-        if part.isdigit():
-
-            parent = parent[
-
-                int(part)
-
-            ]
-
-        else:
-
-            parent = getattr(
-
-                parent,
-
-                part,
-
-            )
-
-
-
-    child_name = parts[-1]
-
-
-
-    return (
-
-        parent,
-
-        child_name,
-
-        linear,
-
-    )
-
-
-
-
-
-def set_child_module(
-
-    parent: nn.Module,
-
-    child_name: str,
-
-    new_module: nn.Module,
-
-):
-
-    if child_name.isdigit():
-
-        parent[
-
-            int(child_name)
-
-        ] = new_module
-
-    else:
-
-        setattr(
-
-            parent,
-
-            child_name,
-
-            new_module,
-
-        )
-
-
-
-
-
-def build_quantum_yolo():
-
-    """
-
-    Build YOLO26n classification model and replace only its
-
-    final classical linear classifier with the 10-qubit head.
-
-    """
-
-
-
-    yolo = YOLO(
-
-        "yolo26n-cls.yaml"
-
-    )
-
-
-
-    torch_model = yolo.model
-
-
-
-    (
-
-        parent,
-
-        child_name,
-
-        old_linear,
-
-    ) = find_last_linear(
-
-        torch_model
-
-    )
-
-
-
-    in_features = int(
-
-        old_linear.in_features
-
-    )
-
-
-
-    print(
-
-        "Replacing YOLO final classifier:"
-
-    )
-
-
-
-    print(
-
-        f"  Linear({in_features}, "
-
-        f"{old_linear.out_features})"
-
-    )
-
-
-
-    print(
-
-        f"  -> 1-qubit quantum head"
-
-    )
-
-
-
-    quantum_head = QuantumYOLOHead(
-
-        in_features=in_features,
-
-        n_qubits=N_QUBITS,
-
-        n_layers=N_Q_LAYERS,
-
-    )
-
-
-
-    set_child_module(
-
-        parent,
-
-        child_name,
-
-        quantum_head,
-
-    )
-
-
-
-    torch_model = torch_model.to(
-
-        DEVICE
-
-    )
-
-
-
-    return torch_model
-
-
-
-
-
-# ============================================================
-
-# CHECKPOINTS
-
-# ============================================================
-
-
-
-def get_checkpoint_path(
-
-    dataset_key: str,
-
-) -> Path:
-
-
-
-    return (
-
-        CHECKPOINT_DIR
-
-        / (
-
-            f"yolo26n_{dataset_key}_"
-
-            f"{N_QUBITS}qubit_cpu.pth"
-
-        )
-
-    )
-
-
-
-
-
-def save_checkpoint(
-
-    model: nn.Module,
-
-    checkpoint_path: Path,
-
-    dataset_name: str,
-
-    epoch: int,
-
-    best_val_accuracy: float,
-
-):
-
-    checkpoint = {
-
-        "dataset_name": str(
-
-            dataset_name
-
-        ),
-
-
-
-        "model_name":
-
-            "YOLO26n-CLS-1Qubit",
-
-
-
-        "n_qubits": int(
-
-            N_QUBITS
-
-        ),
-
-
-
-        "n_q_layers": int(
-
-            N_Q_LAYERS
-
-        ),
-
-
-
-        "epoch": int(
-
-            epoch
-
-        ),
-
-
-
-        "best_val_accuracy": float(
-
-            best_val_accuracy
-
-        ),
-
-
-
-        "pennylane_device": str(
-
-            PENNYLANE_DEVICE
-
-        ),
-
-
-
-        "pennylane_version": str(
-
-            qml.__version__
-
-        ),
-
-
-
-        "torch_version": str(
-
-            torch.__version__
-
-        ),
-
-
-
-        "state_dict":
-
-            model.state_dict(),
-
-    }
-
-
-
-    torch.save(
-
-        checkpoint,
-
-        checkpoint_path,
-
-    )
-
-
-
-    print(
-
-        f"Saved checkpoint: "
-
-        f"{checkpoint_path}"
-
-    )
-
-
-
-
-
-def load_checkpoint(
-
-    checkpoint_path: Path,
-
-):
-
-    """
-
-    Rebuild the architecture first, then load the trained weights.
-
-    """
-
-
-
-    model = build_quantum_yolo()
-
-
-
-    # PyTorch 2.6+:
-
-    # This checkpoint is generated by this script,
-
-    # so it is a trusted local file.
-
-    checkpoint = torch.load(
-
-        checkpoint_path,
-
-        map_location=DEVICE,
-
-        weights_only=False,
-
-    )
-
-
-
-    saved_qubits = int(
-
-        checkpoint.get(
-
-            "n_qubits",
-
-            N_QUBITS,
-
-        )
-
-    )
-
-
-
-    if saved_qubits != N_QUBITS:
-
-        raise RuntimeError(
-
-            f"Checkpoint uses {saved_qubits} qubits, "
-
-            f"but current code uses {N_QUBITS}."
-
-        )
-
-
-
-    model.load_state_dict(
-
-        checkpoint[
-
-            "state_dict"
-
-        ]
-
-    )
-
-
-
-    model = model.to(
-
-        DEVICE
-
-    )
-
-
-
-    model.eval()
-
-
-
-    print(
-
-        f"Loaded checkpoint: "
-
-        f"{checkpoint_path}"
-
-    )
-
-
-
-    print(
-
-        f"Saved epoch: "
-
-        f"{checkpoint.get('epoch', '?')}"
-
-    )
-
-
-
-    print(
-
-        "Saved best validation accuracy: "
-
-        f"{checkpoint.get('best_val_accuracy', '?')}"
-
-    )
-
-
-
-    return model
-
-
-
-
-
-# ============================================================
-
-# DATASETS
-
-# ============================================================
-
-
-
-def make_dataset(
-
-    dataset_class,
-
-    train: bool,
-
-):
-
-    return dataset_class(
-
-        root=str(
-
-            BASE_DIR
-
-        ),
-
-        train=train,
-
-        download=True,
-
-        transform=IMAGE_TRANSFORM,
-
-    )
-
-
-
-
-
-def maybe_subset(
-
-    dataset,
-
-    n_samples: int,
-
-    seed: int,
-
-):
-
-    if (
-
-        n_samples <= 0
-
-        or n_samples >= len(dataset)
-
-    ):
-
-        return dataset
-
-
-
-    generator = torch.Generator()
-
-    generator.manual_seed(
-
-        seed
-
-    )
-
-
-
-    indices = torch.randperm(
-
-        len(dataset),
-
-        generator=generator,
-
-    )[:n_samples]
-
-
-
-    return Subset(
-
-        dataset,
-
-        indices.tolist(),
-
-    )
-
-
-
-
-
-def make_loaders(
-
-    dataset_class,
-
-):
-
-    full_train = make_dataset(
-
-        dataset_class,
-
-        train=True,
-
-    )
-
-
-
-    test_dataset = make_dataset(
-
-        dataset_class,
-
-        train=False,
-
-    )
-
-
-
-    full_train = maybe_subset(
-
-        full_train,
-
-        TRAIN_SAMPLES,
-
-        SEED,
-
-    )
-
-
-
-    test_dataset = maybe_subset(
-
-        test_dataset,
-
-        TEST_SAMPLES,
-
-        SEED + 1,
-
-    )
-
-
-
-    # Use 90/10 train/validation split.
-
-    total = len(
-
-        full_train
-
-    )
-
-
-
-    n_val = max(
-
-        1,
-
-        int(
-
-            0.10 * total
-
-        ),
-
-    )
-
-
-
-    n_train = (
-
-        total - n_val
-
-    )
-
-
-
-    train_dataset, val_dataset = (
-
-        torch.utils.data.random_split(
-
-            full_train,
-
-            [
-
-                n_train,
-
-                n_val,
-
-            ],
-
-            generator=torch.Generator()
-
-            .manual_seed(
-
-                SEED
-
-            ),
-
-        )
-
-    )
-
-
-
-    train_loader = DataLoader(
-
-        train_dataset,
-
-        batch_size=TRAIN_BATCH_SIZE,
-
-        shuffle=True,
-
-        num_workers=0,
-
-    )
-
-
-
-    val_loader = DataLoader(
-
-        val_dataset,
-
-        batch_size=TEST_BATCH_SIZE,
-
-        shuffle=False,
-
-        num_workers=0,
-
-    )
-
-
-
-    test_loader = DataLoader(
-
-        test_dataset,
-
-        batch_size=TEST_BATCH_SIZE,
-
-        shuffle=False,
-
-        num_workers=0,
-
-    )
-
-
-
-    return (
-
-        train_loader,
-
-        val_loader,
-
-        test_loader,
-
-    )
-
-
-
-
-
-# ============================================================
-
-# OUTPUT NORMALIZATION
-
-# ============================================================
-
-
-
-def extract_logits(
-
-    output,
-
-):
-
-    """
-
-    Ultralytics model output can vary slightly by version.
-
-    This helper extracts the classification logits tensor.
-
-    """
-
-
-
-    if isinstance(
-
-        output,
-
-        torch.Tensor,
-
-    ):
-
-        return output
-
-
-
-    if isinstance(
-
-        output,
-
-        (list, tuple),
-
-    ):
-
-        # Prefer a B x 10 tensor.
-
-        for value in output:
-
-            if (
-
-                isinstance(
-
-                    value,
-
-                    torch.Tensor,
-
-                )
-
-                and value.ndim == 2
-
-                and value.shape[-1] == N_CLASSES
-
-            ):
-
-                return value
-
-
-
-        # Fallback to first tensor.
-
-        for value in output:
-
-            if isinstance(
-
-                value,
-
-                torch.Tensor,
-
-            ):
-
-                return value
-
-
-
-    if isinstance(
-
-        output,
-
-        dict,
-
-    ):
-
-        for key in (
-
-            "logits",
-
-            "preds",
-
-            "output",
-
-        ):
-
-            value = output.get(
-
-                key
-
-            )
-
-
-
-            if isinstance(
-
-                value,
-
-                torch.Tensor,
-
-            ):
-
-                return value
-
-
-
-    raise RuntimeError(
-
-        "Could not extract classification logits "
-
-        "from YOLO model output."
-
-    )
-
-
-
-
-
-# ============================================================
-
-# VALIDATION
-
-# ============================================================
-
-
-
-@torch.no_grad()
-
-def evaluate(
-
-    model,
-
-    loader,
-
-    criterion,
-
-):
-
-    model.eval()
-
-
-
-    total_loss = 0.0
-
-    total_correct = 0
-
-    total_count = 0
-
-
-
-    for images, labels in tqdm(
-
-        loader,
-
-        desc="Validation",
-
-        leave=False,
-
-    ):
-
-        images = images.to(
-
-            DEVICE
-
-        )
-
-
-
-        labels = labels.to(
-
-            DEVICE
-
-        )
-
-
-
-        output = model(
-
-            images
-
-        )
-
-
-
-        logits = extract_logits(
-
-            output
-
-        )
-
-
-
-        loss = criterion(
-
-            logits,
-
-            labels,
-
-        )
-
-
-
-        total_loss += (
-
-            float(
-
-                loss.item()
-
-            )
-
-            * labels.size(0)
-
-        )
-
-
-
-        predictions = (
-
-            logits.argmax(
-
-                dim=1
-
-            )
-
-        )
-
-
-
-        total_correct += int(
-
-            (
-
-                predictions
-
-                == labels
-
-            )
-
-            .sum()
-
-            .item()
-
-        )
-
-
-
-        total_count += (
-
-            labels.size(0)
-
-        )
-
-
-
-    return (
-
-        total_loss
-
-        / max(
-
-            1,
-
-            total_count,
-
-        ),
-
-
-
-        total_correct
-
-        / max(
-
-            1,
-
-            total_count,
-
-        ),
-
-    )
-
-
-
-
-
-# ============================================================
-
-# TRAINING
-
-# ============================================================
-
-
-
-def train_model(
-
-    dataset_name: str,
-
-    model: nn.Module,
-
-    train_loader,
-
-    val_loader,
-
-    checkpoint_path: Path,
-
-):
-
-    criterion = (
-
-        nn.CrossEntropyLoss()
-
-    )
-
-
-
-    optimizer = torch.optim.AdamW(
-
-        model.parameters(),
-
-        lr=LEARNING_RATE,
-
-        weight_decay=WEIGHT_DECAY,
-
-    )
-
-
-
-    best_val_accuracy = -1.0
-
-
-
-    for epoch in range(
-
-        1,
-
-        EPOCHS + 1,
-
-    ):
-
-        model.train()
-
-
-
-        total_loss = 0.0
-
-        total_correct = 0
-
-        total_count = 0
-
-
-
-        progress = tqdm(
-
-            train_loader,
-
-            desc=(
-
-                f"{dataset_name} "
-
-                f"epoch {epoch}/{EPOCHS}"
-
-            ),
-
-            unit="batch",
-
-        )
-
-
-
-        for images, labels in progress:
-
-            images = images.to(
-
-                DEVICE
-
-            )
-
-
-
-            labels = labels.to(
-
-                DEVICE
-
-            )
-
-
-
-            optimizer.zero_grad(
-
-                set_to_none=True
-
-            )
-
-
-
-            output = model(
-
-                images
-
-            )
-
-
-
-            logits = extract_logits(
-
-                output
-
-            )
-
-
-
-            loss = criterion(
-
-                logits,
-
-                labels,
-
-            )
-
-
-
-            loss.backward()
-
-
-
-            optimizer.step()
-
-
-
-            batch_size = (
-
-                labels.size(0)
-
-            )
-
-
-
-            total_loss += (
-
-                float(
-
-                    loss.item()
-
-                )
-
-                * batch_size
-
-            )
-
-
-
-            predictions = (
-
-                logits.argmax(
-
-                    dim=1
-
-                )
-
-            )
-
-
-
-            total_correct += int(
-
-                (
-
-                    predictions
-
-                    == labels
-
-                )
-
-                .sum()
-
-                .item()
-
-            )
-
-
-
-            total_count += (
-
-                batch_size
-
-            )
-
-
-
-            progress.set_postfix(
-
-                loss=round(
-
-                    total_loss
-
-                    / max(
-
-                        1,
-
-                        total_count,
-
-                    ),
-
-                    4,
-
-                ),
-
-                acc=round(
-
-                    total_correct
-
-                    / max(
-
-                        1,
-
-                        total_count,
-
-                    ),
-
-                    4,
-
-                ),
-
-            )
-
-
-
-        train_loss = (
-
-            total_loss
-
-            / max(
-
-                1,
-
-                total_count,
-
-            )
-
-        )
-
-
-
-        train_accuracy = (
-
-            total_correct
-
-            / max(
-
-                1,
-
-                total_count,
-
-            )
-
-        )
-
-
-
-        (
-
-            val_loss,
-
-            val_accuracy,
-
-        ) = evaluate(
-
-            model,
-
-            val_loader,
-
-            criterion,
-
-        )
-
-
-
-        print(
-
-            f"\nEpoch {epoch}: "
-
-            f"train_loss={train_loss:.4f}, "
-
-            f"train_acc={train_accuracy:.4f}, "
-
-            f"val_loss={val_loss:.4f}, "
-
-            f"val_acc={val_accuracy:.4f}"
-
-        )
-
-
-
-        # Save best checkpoint.
-
-        if (
-
-            val_accuracy
-
-            > best_val_accuracy
-
-        ):
-
-            best_val_accuracy = (
-
-                val_accuracy
-
-            )
-
-
-
-            save_checkpoint(
-
-                model=model,
-
-                checkpoint_path=(
-
-                    checkpoint_path
-
-                ),
-
-                dataset_name=(
-
-                    dataset_name
-
-                ),
-
-                epoch=epoch,
-
-                best_val_accuracy=(
-
-                    best_val_accuracy
-
-                ),
-
-            )
-
-
-
-    # Return the best model, not just the last epoch.
-
-    return load_checkpoint(
-
-        checkpoint_path
-
-    )
-
-
-
-
-
-# ============================================================
-
-# TRAIN IF MISSING / LOAD IF AVAILABLE
-
-# ============================================================
-
-
-
-def get_or_train_model(
-
-    dataset_name: str,
-
-    dataset_key: str,
-
-    train_loader,
-
-    val_loader,
-
-):
-
-    checkpoint_path = (
-
-        get_checkpoint_path(
-
-            dataset_key
-
-        )
-
-    )
-
-
-
-    if (
-
-        checkpoint_path.exists()
-
-        and not FORCE_RETRAIN
-
-    ):
-
-        print(
-
-            "\nSaved 1-qubit YOLO model found."
-
-        )
-
-
-
-        model = load_checkpoint(
-
-            checkpoint_path
-
-        )
-
-
-
-        return (
-
-            model,
-
-            checkpoint_path,
-
-        )
-
-
-
-    print(
-
-        "\nNo saved 1-qubit YOLO model found."
-
-    )
-
-
-
-    print(
-
-        f"Training for {EPOCHS} epochs "
-
-        f"with {N_QUBITS} qubits..."
-
-    )
-
-
-
-    model = build_quantum_yolo()
-
-
-
-    model = train_model(
-
-        dataset_name=dataset_name,
-
-        model=model,
-
-        train_loader=train_loader,
-
-        val_loader=val_loader,
-
-        checkpoint_path=(
-
-            checkpoint_path
-
-        ),
-
-    )
-
-
-
-    return (
-
-        model,
-
-        checkpoint_path,
-
-    )
-
-
-
-
-
-# ============================================================
-# TELEMETRY SUPPORT
-# ============================================================
+ def __init__(self,in_features,num_classes,n_qubits=N_QUBITS):
+  super().__init__()
+  self.n_qubits=n_qubits
+  self.feature_to_qubits=nn.Linear(in_features,n_qubits)
+  self.q_weights=nn.Parameter(torch.randn(N_Q_LAYERS,n_qubits,3)*0.01)
+  self.classifier=nn.Linear(n_qubits,num_classes)
+  self.qnode=make_qnode(n_qubits)
+ def forward(self,x):
+  if x.ndim==1: x=x.unsqueeze(0)
+  angles=torch.tanh(self.feature_to_qubits(x))*torch.pi
+  rows=[]
+  for one in angles:
+   out=self.qnode(one,self.q_weights)
+   if isinstance(out,torch.Tensor): features=out.reshape(-1)
+   else: features=torch.stack(list(out)).reshape(-1)
+   rows.append(features.to(dtype=self.classifier.weight.dtype))
+  return self.classifier(torch.stack(rows,0))
+
+def get_last_linear(model):
+ matches=[(name,module) for name,module in model.named_modules() if isinstance(module,nn.Linear)]
+ if not matches: raise RuntimeError('YOLO classification model has no nn.Linear; check Ultralytics version')
+ name,layer=matches[-1]
+ parent=model
+ for key in name.split('.')[:-1]: parent=parent[int(key)] if key.isdecimal() else getattr(parent,key)
+ return parent,name.split('.')[-1],layer
+
+def build_model(n_classes):
+ yolo=YOLO('yolo26n-cls.yaml')
+ model=yolo.model
+ parent,key,old=get_last_linear(model)
+ new=QuantumYOLOHead(old.in_features,n_classes)
+ if key.isdecimal(): parent[int(key)]=new
+ else: setattr(parent,key,new)
+ return model.to(DEVICE)
+
+def get_logits(output,n_classes):
+ if isinstance(output,torch.Tensor):
+  if output.ndim==2 and output.shape[1]==n_classes: return output
+ if isinstance(output,(tuple,list)):
+  # Ultralytics Classify.forward(eval) generally returns (probs, logits).
+  tensors=[x for x in output if isinstance(x,torch.Tensor) and x.ndim==2 and x.shape[1]==n_classes]
+  if tensors: return tensors[-1]  # logits preferred, not probabilities
+ if isinstance(output,dict):
+  for key in ('logits','preds','output'):
+   if key in output: return get_logits(output[key],n_classes)
+ raise RuntimeError(f'Unexpected YOLO logits format: {type(output)}')
+
+def checkpoint_path(dataset_key):
+ return CHECKPOINT_DIR/f'hybrid_yolo26n_{dataset_key}_{N_QUBITS}q_{N_Q_LAYERS}layers_{IMG_SIZE}px_v2.pth'
+
+def load_or_train(name,key,n_classes,train_loader,val_loader):
+ path=checkpoint_path(key)
+ model=build_model(n_classes)
+ if path.exists() and not FORCE_RETRAIN:
+  try: ck=torch.load(path,map_location='cpu',weights_only=True)
+  except TypeError: ck=torch.load(path,map_location='cpu')
+  if ck.get('n_classes')!=n_classes or ck.get('n_qubits')!=N_QUBITS:
+   raise RuntimeError(f'Checkpoint shape mismatch: {path}')
+  model.load_state_dict(ck['state_dict'],strict=True)
+  print(f'Loaded {path}')
+  return model.eval(),path
+ loss_fn=nn.CrossEntropyLoss()
+ opt=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WEIGHT_DECAY)
+ best=-1.0
+ for epoch in range(1,EPOCHS+1):
+  model.train()
+  train_ok=train_n=0
+  for x,y in tqdm(train_loader,desc=f'{name} training {epoch}/{EPOCHS}'):
+   x=x.to(DEVICE); y=y.to(DEVICE)
+   opt.zero_grad(set_to_none=True)
+   logits=get_logits(model(x),n_classes)
+   loss=loss_fn(logits,y)
+   loss.backward(); opt.step()
+   train_ok+=int((logits.argmax(1)==y).sum()); train_n+=len(y)
+  model.eval(); val_ok=val_n=0
+  with torch.no_grad():
+   for x,y in val_loader:
+    logits=get_logits(model(x.to(DEVICE)),n_classes)
+    val_ok+=int((logits.argmax(1)==y.to(DEVICE)).sum()); val_n+=len(y)
+  val_acc=val_ok/max(val_n,1)
+  print(f'{name} epoch={epoch} train_acc={train_ok/max(train_n,1):.4f} val_acc={val_acc:.4f}')
+  if val_acc>best:
+   best=val_acc
+   torch.save({'state_dict':model.state_dict(),'n_classes':n_classes,'n_qubits':N_QUBITS,'epoch':epoch,'val_acc':val_acc},path)
+ try: ck=torch.load(path,map_location='cpu',weights_only=True)
+ except TypeError: ck=torch.load(path,map_location='cpu')
+ model.load_state_dict(ck['state_dict'],strict=True)
+ return model.eval(),path
 
 def get_cpu_model():
     try:
@@ -2518,9 +421,9 @@ def run_single_inference_with_telemetry(model, image, dataset_key):
     tracker = None
     if CODECARBON_AVAILABLE:
         tracker = EmissionsTracker(
-            project_name=f"yolo_1qubit_{dataset_key}_test",
+            project_name=f"yolo_{N_QUBITS}qubit_{dataset_key}_test",
             output_dir=str(energy_dir),
-            output_file=f"codecarbon_yolo_1qubit_{dataset_key}.csv",
+            output_file=f"codecarbon_yolo_{N_QUBITS}qubit_{dataset_key}.csv",
             log_level="error",
             save_to_file=True,
         )
@@ -2528,7 +431,7 @@ def run_single_inference_with_telemetry(model, image, dataset_key):
     if DEVICE.type == "cuda": torch.cuda.synchronize()
     t0=time.perf_counter()
     output=model(image)
-    logits=extract_logits(output)
+    logits=get_logits(output,ACTIVE_CLASSES)
     if DEVICE.type == "cuda": torch.cuda.synchronize()
     exec_time=time.perf_counter()-t0
     cpu_energy=gpu_energy=ram_energy=total_energy=0.0
@@ -2552,7 +455,7 @@ def build_telemetry_row(model_name,prediction,exec_time,parameters,true_label,sa
     if logits is not None:
         confidence_score,logit_margin,entropy=get_prediction_quality(logits)
     total_energy=total_energy or 0.0; cpu_energy=cpu_energy or 0.0; gpu_energy=gpu_energy or 0.0; ram_energy=ram_energy or 0.0
-    input_tokens=784; output_tokens=1; total_tokens=input_tokens+output_tokens
+    input_tokens=IMG_SIZE*IMG_SIZE*3; output_tokens=1; total_tokens=input_tokens+output_tokens
     joules_per_token=energy_per_token_kwh=watts_estimated=gpu_energy_pct=cpu_energy_pct=0.0
     if total_energy>0 and total_tokens>0:
         energy_per_token_kwh=round(total_energy/total_tokens,12)
@@ -2665,333 +568,69 @@ def backfill_final_metrics(output_path, metrics):
     df.to_csv(output_path,index=False)
 
 
-# ============================================================
-# TEST MODEL
-# ============================================================
-
-
-
-@torch.no_grad()
-
-def test_model(
-    dataset_name,
-    dataset_key,
-    model,
-    test_loader,
-    checkpoint_path,
-):
-    model.eval()
-    y_true=[]
-    y_pred=[]
-    parameters=int(sum(p.numel() for p in model.parameters()))
-    model_flops=None
-    model_name=f"YOLO26n-CLS-{N_QUBITS}Qubit"
-    output_path=DEVICE_LOG_DIR / f"yolo26n_{dataset_key}_{N_QUBITS}qubit_test_telemetry.csv"
-    if output_path.exists():
-        output_path.unlink()
-    sample_index=0
-    for images,labels in tqdm(test_loader,desc=f"Testing {dataset_name}",unit="batch"):
-        images=images.to(DEVICE)
-        labels=labels.to(DEVICE)
-        for local_index in range(images.size(0)):
-            single_image=images[local_index:local_index+1]
-            true_label=int(labels[local_index].item())
-            (logits,exec_time,cpu_energy,gpu_energy,ram_energy,total_energy,emissions_value,carbon_intensity,gpu_metrics)=run_single_inference_with_telemetry(model,single_image,dataset_key)
-            prediction=int(logits.argmax(dim=1).item())
-            y_pred.append(prediction)
-            y_true.append(true_label)
-            row=build_telemetry_row(
-                model_name=model_name,
-                prediction=prediction,
-                exec_time=exec_time,
-                parameters=parameters,
-                true_label=true_label,
-                sample_index=sample_index,
-                logits=logits,
-                cpu_energy=cpu_energy,
-                gpu_energy=gpu_energy,
-                ram_energy=ram_energy,
-                total_energy=total_energy,
-                emissions_value=emissions_value,
-                carbon_intensity=carbon_intensity,
-                gpu_metrics=gpu_metrics,
-                model_flops=model_flops,
-                quantum_computing=True,
-                dataset_name=dataset_name,
-                sample_id=sample_index,
-                checkpoint_path=checkpoint_path,
-                under_attack=False,
-            )
-            append_single_row(row,output_path)
-            sample_index+=1
-    accuracy=accuracy_score(y_true,y_pred)
-    precision=precision_score(y_true,y_pred,labels=list(range(N_CLASSES)),average="weighted",zero_division=0)
-    recall=recall_score(y_true,y_pred,labels=list(range(N_CLASSES)),average="weighted",zero_division=0)
-    f1=f1_score(y_true,y_pred,labels=list(range(N_CLASSES)),average="weighted",zero_division=0)
-    metrics={
-        "accuracy":float(accuracy),
-        "precision_weighted":float(precision),
-        "recall_weighted":float(recall),
-        "f1_weighted":float(f1),
-    }
-    backfill_final_metrics(output_path,metrics)
-    print(f"\n{dataset_name} TEST RESULTS")
-    print(f"Accuracy : {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1       : {f1:.4f}")
-    print(f"Telemetry: {output_path.resolve()}")
-    return metrics
-
 
 
 # ============================================================
-
-# MAIN
-
+# TEST / RESUME, preserves all telemetry columns from uploaded code
 # ============================================================
+def backfill_from_csv(output_path,n_classes):
+ df=pd.read_csv(output_path)
+ if df.empty: return
+ good=df.dropna(subset=['true_label','prediction'])
+ if good.empty: return
+ yt=good.true_label.astype(int).to_numpy(); yp=good.prediction.astype(int).to_numpy()
+ metrics={'accuracy':accuracy_score(yt,yp),
+          'precision_weighted':precision_score(yt,yp,labels=list(range(n_classes)),average='weighted',zero_division=0),
+          'recall_weighted':recall_score(yt,yp,labels=list(range(n_classes)),average='weighted',zero_division=0),
+          'f1_weighted':f1_score(yt,yp,labels=list(range(n_classes)),average='weighted',zero_division=0)}
+ for key,value in [('model_accuracy','accuracy'),('model_precision_weighted','precision_weighted'),('model_recall_weighted','recall_weighted'),('model_f1_weighted','f1_weighted')]: df[key]=float(metrics[value])
+ df.to_csv(output_path,index=False)
+ print('Metrics:',metrics)
 
-
+def test_model(name,key,n_classes,model,test_loader,path):
+ model.eval()
+ label=f'HybridYOLO26n-{N_QUBITS}Q'
+ out=DEVICE_LOG_DIR/f'yolo26n_{key}_{N_QUBITS}qubit_{IMG_SIZE}px_v2_test_telemetry.csv'
+ # Skip rows by stable test-set sample index, not row counts.
+ done=set()
+ if out.is_file():
+  df=pd.read_csv(out)
+  if not {'sample_index','model_type'}.issubset(df.columns):
+   raise RuntimeError(f'Existing telemetry schema mismatch: {out}')
+  done=set(df.loc[df.model_type==label,'sample_index'].dropna().astype(int))
+ param_count=sum(p.numel() for p in model.parameters())
+ i=0
+ for x,y in tqdm(test_loader,desc=f'{name} telemetry'):
+  for k in range(len(y)):
+   idx=i;i+=1
+   if idx in done: continue
+   one=x[k:k+1].to(DEVICE)
+   label_true=int(y[k])
+   with torch.no_grad():
+    (logits,elapsed,cpu_e,gpu_e,ram_e,total_e,emission,ci,gpu)=run_single_inference_with_telemetry(model,one,key)
+   predicted=int(logits.argmax(dim=1).item())
+   row=build_telemetry_row(model_name=label,prediction=predicted,exec_time=elapsed,
+    parameters=param_count,true_label=label_true,sample_index=idx,logits=logits,
+    cpu_energy=cpu_e,gpu_energy=gpu_e,ram_energy=ram_e,total_energy=total_e,
+    emissions_value=emission,carbon_intensity=ci,gpu_metrics=gpu,model_flops=None,
+    quantum_computing=True,dataset_name=name,sample_id=idx,checkpoint_path=path)
+   append_single_row(row,out)
+   done.add(idx)
+ if out.is_file():
+  backfill_from_csv(out,n_classes)
+  print('Saved:',out)
 
 def main():
-
-
-
-    print(
-
-        "=" * 72
-
-    )
-
-
-
-    print(
-
-        "YOLO26n-CLS + 1-QUBIT "
-
-        "PENNYLANE CLASSIFIER"
-
-    )
-
-
-
-    print(
-
-        "=" * 72
-
-    )
-
-
-
-    print(
-
-        f"PyTorch device   : {DEVICE}"
-
-    )
-
-
-
-    print(
-
-        f"PennyLane device : "
-
-        f"{PENNYLANE_DEVICE}"
-
-    )
-
-
-
-    print(
-
-        f"Qubits           : "
-
-        f"{N_QUBITS}"
-
-    )
-
-
-
-    print(
-
-        f"Quantum layers   : "
-
-        f"{N_Q_LAYERS}"
-
-    )
-
-
-
-    print(
-
-        f"Epochs           : "
-
-        f"{EPOCHS}"
-
-    )
-
-
-
-    print(
-
-        f"Train batch      : "
-
-        f"{TRAIN_BATCH_SIZE}"
-
-    )
-
-
-
-    print(
-
-        f"Train samples    : "
-
-        f"{TRAIN_SAMPLES if TRAIN_SAMPLES > 0 else 'ALL'}"
-
-    )
-
-
-
-    for (
-
-        dataset_name,
-
-        config,
-
-    ) in DATASET_CONFIGS.items():
-
-
-
-        print(
-
-            "\n"
-
-            + "=" * 72
-
-        )
-
-
-
-        print(
-
-            f"DATASET: "
-
-            f"{dataset_name}"
-
-        )
-
-
-
-        print(
-
-            "=" * 72
-
-        )
-
-
-
-        (
-
-            train_loader,
-
-            val_loader,
-
-            test_loader,
-
-        ) = make_loaders(
-
-            config[
-
-                "dataset_class"
-
-            ]
-
-        )
-
-
-
-        (
-
-            model,
-
-            checkpoint_path,
-
-        ) = get_or_train_model(
-
-            dataset_name=(
-
-                dataset_name
-
-            ),
-
-            dataset_key=(
-
-                config["key"]
-
-            ),
-
-            train_loader=(
-
-                train_loader
-
-            ),
-
-            val_loader=(
-
-                val_loader
-
-            ),
-
-        )
-
-
-
-        print(
-
-            f"Using checkpoint: "
-
-            f"{checkpoint_path}"
-
-        )
-        test_model(
-            dataset_name=(
-                dataset_name
-            ),
-            dataset_key=(
-                config["key"]
-            ),
-            model=model,
-            test_loader=(
-                test_loader
-            ),
-            checkpoint_path=(
-                checkpoint_path
-            ),
-        )
-
-
-
-        del model
-
-
-
-        if torch.cuda.is_available():
-
-            torch.cuda.empty_cache()
-
-
-
-    print(
-
-        "\nAll YOLO 1-qubit "
-
-        "models complete."
-
-    )
-
-
-
-
-
-if __name__ == "__main__":
-
-    main()
+ print('Hybrid YOLO26n + 4-layer simulated VQC',N_QUBITS,'qubits; device:',DEVICE)
+ for name in SELECTED_DATASETS:
+  global ACTIVE_CLASSES
+  _,key,n_classes=DATASET_CONFIGS[name]
+  ACTIVE_CLASSES=n_classes
+  print('\n======',name,'classes',n_classes,'======')
+  train_loader,val_loader,test_loader=make_loaders(name)
+  model,path=load_or_train(name,key,n_classes,train_loader,val_loader)
+  test_model(name,key,n_classes,model,test_loader,path)
+  del model
+ print('Done')
+
+if __name__=='__main__': main()
