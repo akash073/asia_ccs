@@ -244,7 +244,7 @@ def load_dataset_pair(dataset_name, config):
 
 QUANTUM_MODELS = (
     "QuantumCNN4",
-    "QuantumDNN4",
+    #"QuantumDNN4",
 )
 
 
