@@ -1,7 +1,8 @@
 # Full official training split is used by default (TRAIN_SAMPLES=0,
-# VALIDATION_FRACTION=0). Existing partial-run checkpoints remain separate.
+# VALIDATION_FRACTION=0), with a default five-qubit quantum head.
+# Existing partial-run checkpoints remain separate.
 # Official test/validation split is reserved for telemetry evaluation.
-"""Hybrid YOLO26n classification + PennyLane 4-layer VQC.
+"""Hybrid YOLO26n classification + PennyLane 4-layer, 5-qubit VQC.
 Supports MNIST, FashionMNIST, KMNIST, CIFAR100 and TinyImageNet200.
 Auto-trains missing dataset-specific checkpoints; evaluates official held-out splits.
 Keeps original unified telemetry schema and resumes incomplete CSVs.
@@ -40,7 +41,7 @@ NUM_WORKERS=int(os.getenv('NUM_WORKERS','0'))
 LR=float(os.getenv('LEARNING_RATE','0.001'))
 WEIGHT_DECAY=float(os.getenv('WEIGHT_DECAY','0.0005'))
 IMG_SIZE=int(os.getenv('IMG_SIZE','64'))
-N_QUBITS=int(os.getenv('N_QUBITS','4'))
+N_QUBITS=int(os.getenv('N_QUBITS','5'))  # default: five simulated qubits
 N_Q_LAYERS=4
 ACTIVE_CLASSES=10
 PENNYLANE_DEVICE=os.getenv('PENNYLANE_DEVICE','default.qubit')

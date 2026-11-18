@@ -1,31 +1,9 @@
-# ============================================================
-# 4-LAYER QUANTUM DNN + 4-LAYER QUANTUM CNN
-# SAME TELEMETRY SCHEMA AS THE UPLOADED CLASSICAL CNN/DNN CODE
-#
-# Key difference:
-#     quantum_computing = True
-#
-# Quantum-only fields are populated:
-#     source_qubits
-#     n_qubits
-#     fidelity
-#     pennylane_device
-#     pennylane_version
-#
-# Behavior:
-#   - 4 qubits by default (configurable)
-#   - exactly 4 quantum layers
-#   - train if checkpoint does not exist
-#   - load saved checkpoint if available
-#   - train for 10 epochs by default
-#   - collect the same runtime/system telemetry columns
-#   - save one CSV per model/dataset
-#   - backfill Accuracy / Precision / Recall / F1
-# ============================================================
-
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import warnings
 import os
 import platform
 import socket
@@ -64,11 +42,11 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 NUM_TEST_SAMPLES = int(
-    os.getenv("NUM_TEST_SAMPLES", "10")
+    os.getenv("NUM_TEST_SAMPLES", "0")
 )
 
 TRAIN_SAMPLES = int(
-    os.getenv("TRAIN_SAMPLES", "60000")
+    os.getenv("TRAIN_SAMPLES", "0")
 )
 
 TRAIN_EPOCHS = int(
@@ -84,16 +62,27 @@ LEARNING_RATE = float(
 )
 
 FLUSH_EVERY = int(
-    os.getenv("FLUSH_EVERY", "25")
+    os.getenv("FLUSH_EVERY", "50")
 )
 
 DNN_QUBITS = int(
-    os.getenv("DNN_QUBITS", "4")
+    os.getenv("DNN_QUBITS", "5")
 )
 
 CNN_QUBITS = int(
-    os.getenv("CNN_QUBITS", "4")
+    os.getenv("CNN_QUBITS", "5")
 )
+
+# 0 means every available sample from the official dataset split.
+# By default ALL selected training samples are used for optimization.
+# Set VALIDATION_FRACTION (e.g. 0.15) to reserve a validation set instead.
+VALIDATION_FRACTION = float(os.getenv("VALIDATION_FRACTION", "0"))
+if not 0 <= VALIDATION_FRACTION < 1:
+    raise ValueError("VALIDATION_FRACTION must be in [0, 1)")
+if TRAIN_SAMPLES < 0 or NUM_TEST_SAMPLES < 0 or TRAIN_EPOCHS < 1:
+    raise ValueError("Sample limits must be nonnegative and TRAIN_EPOCHS >= 1")
+if FLUSH_EVERY < 1 or TRAIN_BATCH_SIZE < 1:
+    raise ValueError("FLUSH_EVERY and TRAIN_BATCH_SIZE must be >= 1")
 
 N_LAYERS = 4
 N_CLASSES = 10
@@ -181,7 +170,7 @@ DATASET_CONFIGS = {
 
 # A new checkpoint filename prevents loading weights learned with the original
 # degenerate 1-qubit min/max preprocessing.
-PREPROCESSING_VERSION = 2
+PREPROCESSING_VERSION = 3
 
 class TinyImageNetValidation(torch.utils.data.Dataset):
     """Original Tiny ImageNet 200 validation layout (with annotations)."""
@@ -1078,8 +1067,8 @@ REFERENCE_COLUMNS = [
 def preprocess_image(image_tensor, n_qubits, mean, std):
     """Compress normalized image to bounded rotation angles.
 
-    tanh preserves magnitude for n_qubits=1; unlike per-image min/max,
-    a single-qubit input is not identically zero. Applies equally to RGB.
+    Uses spatial adaptive pooling followed by tanh; RGB is converted to
+    a coarse grayscale representation. All 5-qubit image encodings are lossy.
     """
     if n_qubits < 1:
         raise ValueError("n_qubits must be >= 1")
@@ -1087,9 +1076,12 @@ def preprocess_image(image_tensor, n_qubits, mean, std):
     flat = image.reshape(-1)
     if n_qubits > flat.numel():
         raise ValueError(f"n_qubits={n_qubits} exceeds pixels={flat.numel()}")
-    chunks = torch.tensor_split(flat, n_qubits)
-    compressed = torch.stack([chunk.mean() for chunk in chunks])
-    return torch.pi * torch.tanh(compressed)
+    # Deterministic spatial pooling, preserving coarse image structure better
+    # than contiguous chunks of a flattened RGB image. This is still highly
+    # lossy for 5 qubits and is NOT equivalent to a conventional image encoder.
+    grayscale = image.mean(dim=0, keepdim=True).unsqueeze(0)
+    pooled = F.adaptive_avg_pool2d(grayscale, (1, n_qubits)).reshape(-1)
+    return torch.pi * torch.tanh(pooled)
 
 
 # ============================================================
@@ -1609,22 +1601,24 @@ class Quantum4LayerClassifier(
 # 12. CHECKPOINT SAVE / LOAD
 # ============================================================
 
-def get_checkpoint_path(
-    model_name,
-    dataset_name,
-    n_qubits,
-):
+def training_config_id(dataset_name, model_name, n_qubits):
+    config = {
+        "dataset": dataset_name, "model": model_name, "qubits": n_qubits,
+        "layers": N_LAYERS, "preprocessing": PREPROCESSING_VERSION,
+        "seed": SEED, "train_samples": TRAIN_SAMPLES,
+        "epochs": TRAIN_EPOCHS, "batch_size": TRAIN_BATCH_SIZE,
+        "lr": LEARNING_RATE, "validation_fraction": VALIDATION_FRACTION,
+        "pennylane_device": PENNYLANE_DEVICE,
+    }
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
 
-    return (
-        CHECKPOINT_DIR
-        / (
-            f"{dataset_name.lower()}_"
-            f"{model_name.lower()}_"
-            f"{n_qubits}qubit_"
-            f"4layer_preproc{PREPROCESSING_VERSION}.pth"
-        )
+
+def get_checkpoint_path(model_name, dataset_name, n_qubits):
+    config_id = training_config_id(dataset_name, model_name, n_qubits)
+    return CHECKPOINT_DIR / (
+        f"{dataset_name.lower()}_{model_name.lower()}_{n_qubits}qubit_"
+        f"4layer_preproc{PREPROCESSING_VERSION}_{config_id}.pth"
     )
-
 
 def save_checkpoint(
     model,
@@ -1707,7 +1701,7 @@ def load_checkpoint(
     checkpoint = torch.load(
         path,
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
 
     if checkpoint.get("preprocessing_version") != PREPROCESSING_VERSION:
@@ -1823,95 +1817,24 @@ class QuantumDataset(
         )
 
 
-def make_train_val_loaders(
-    train_dataset,
-    n_qubits,
-    mean,
-    std,
-):
-
-    total = min(
-        TRAIN_SAMPLES,
-        len(
-            train_dataset
-        ),
-    )
-
-    if total < 2:
-        raise ValueError("TRAIN_SAMPLES must be >= 2 for disjoint train/validation splits")
-
-    rng = (
-        np.random
-        .default_rng(
-            SEED
-        )
-    )
-
-    indices = rng.permutation(
-        len(
-            train_dataset
-        )
-    )[:total]
-
-    n_val = max(
-        1,
-        int(
-            0.15
-            * total
-        ),
-    )
-
-    val_idx = (
-        indices[
-            :n_val
-        ]
-    )
-
-    train_idx = (
-        indices[
-            n_val:
-        ]
-    )
-
-    train_q = QuantumDataset(
-        train_dataset,
-        train_idx,
-        n_qubits,
-        mean,
-        std,
-    )
-
-    val_q = QuantumDataset(
-        train_dataset,
-        val_idx,
-        n_qubits,
-        mean,
-        std,
-    )
-
-    train_loader = DataLoader(
-        train_q,
-        batch_size=(
-            TRAIN_BATCH_SIZE
-        ),
-        shuffle=True,
-        num_workers=0,
-    )
-
-    val_loader = DataLoader(
-        val_q,
-        batch_size=(
-            TRAIN_BATCH_SIZE
-        ),
-        shuffle=False,
-        num_workers=0,
-    )
-
-    return (
-        train_loader,
-        val_loader,
-    )
-
+def make_train_val_loaders(train_dataset, n_qubits, mean, std):
+    total = len(train_dataset) if TRAIN_SAMPLES == 0 else min(TRAIN_SAMPLES, len(train_dataset))
+    if total < 1:
+        raise ValueError("Training split is empty")
+    rng = np.random.default_rng(SEED)
+    indices = rng.permutation(len(train_dataset))[:total]
+    n_val = max(1, round(VALIDATION_FRACTION * total)) if VALIDATION_FRACTION else 0
+    if n_val >= total:
+        raise ValueError("VALIDATION_FRACTION leaves no training examples")
+    val_idx, train_idx = indices[:n_val], indices[n_val:]
+    train_q = QuantumDataset(train_dataset, train_idx, n_qubits, mean, std)
+    train_loader = DataLoader(train_q, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = None
+    if n_val:
+        val_q = QuantumDataset(train_dataset, val_idx, n_qubits, mean, std)
+        val_loader = DataLoader(val_q, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=0)
+    print(f"Train samples used: {len(train_idx):,}; validation: {n_val:,}")
+    return train_loader, val_loader
 
 # ============================================================
 # 14. TRAIN / VALIDATE
@@ -2092,42 +2015,19 @@ def train_model(
                 ),
             )
 
-        val_loss, val_acc = (
-            evaluate_loss(
-                model,
-                val_loader,
-                criterion,
-            )
-        )
-
-        print(
-            f"Epoch {epoch}: "
-            f"train_loss="
-            f"{running_loss/max(1,total_count):.4f}, "
-            f"train_acc="
-            f"{total_correct/max(1,total_count):.4f}, "
-            f"val_loss="
-            f"{val_loss:.4f}, "
-            f"val_acc="
-            f"{val_acc:.4f}"
-        )
-
-        if (
-            val_loss
-            < best_val_loss
-        ):
-
-            best_val_loss = (
-                val_loss
-            )
-
-            save_checkpoint(
-                model,
-                checkpoint_path,
-                dataset_name,
-                epoch,
-                best_val_loss,
-            )
+        if val_loader is not None:
+            val_loss, val_acc = evaluate_loss(model, val_loader, criterion)
+            print(f"Epoch {epoch}: train_loss={running_loss/max(1,total_count):.4f}, "
+                  f"train_acc={total_correct/max(1,total_count):.4f}, "
+                  f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, checkpoint_path, dataset_name, epoch, best_val_loss)
+        else:
+            # Full-data training: there is no independent validation loss.
+            print(f"Epoch {epoch}: train_loss={running_loss/max(1,total_count):.4f}, "
+                  f"train_acc={total_correct/max(1,total_count):.4f}")
+            save_checkpoint(model, checkpoint_path, dataset_name, epoch, float('nan'))
 
     return load_checkpoint(
         checkpoint_path
@@ -2388,114 +2288,34 @@ def extract_energy_data(
     )
 
 
-def run_with_energy_tracking(
-    inference_fn,
-    *args,
-    project_name,
-    codecarbon_filename,
-    **kwargs,
-):
+def run_with_energy_tracking(inference_fn, *args, project_name, codecarbon_filename, **kwargs):
+    """One measurement interval for a group of inferences.
 
-    energy_dir = (
-        OUTPUT_ROOT
-        / "codecarbon"
-    )
-
-    energy_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    The returned energy represents the entire interval, not an instrumented
+    per-example energy reading. Callers amortize it over the group. CodeCarbon
+    is an estimate and can report zero for very brief intervals.
+    """
     tracker = None
-
     if CODECARBON_AVAILABLE:
-
-        tracker = (
-            EmissionsTracker(
-                project_name=
-                    project_name,
-
-                output_dir=
-                    str(
-                        energy_dir
-                    ),
-
-                output_file=
-                    codecarbon_filename,
-
-                log_level=
-                    "error",
-
-                save_to_file=
-                    True,
-            )
+        energy_dir = OUTPUT_ROOT / "codecarbon"
+        energy_dir.mkdir(parents=True, exist_ok=True)
+        tracker = EmissionsTracker(
+            project_name=project_name, output_dir=str(energy_dir),
+            output_file=codecarbon_filename, log_level="error", save_to_file=True,
         )
-
         tracker.start()
-
-    if DEVICE.type == "cuda":
-        torch.cuda.synchronize()
-
-    t0 = (
-        time.perf_counter()
-    )
-
-    result = (
-        inference_fn(
-            *args,
-            **kwargs,
-        )
-    )
-
-    if DEVICE.type == "cuda":
-        torch.cuda.synchronize()
-
-    exec_time = (
-        time.perf_counter()
-        - t0
-    )
-
-    cpu_energy = 0.0
-    gpu_energy = 0.0
-    ram_energy = 0.0
-    total_energy = 0.0
-    emissions_value = 0.0
-    carbon_intensity = None
-
-    if tracker is not None:
-
-        emissions_value = (
-            tracker.stop()
-            or 0.0
-        )
-
-        (
-            cpu_energy,
-            gpu_energy,
-            ram_energy,
-            total_energy,
-            carbon_intensity,
-        ) = extract_energy_data(
-            tracker,
-            emissions_value,
-        )
-
-    gpu_metrics = (
-        get_gpu_metrics()
-    )
-
-    return (
-        result,
-        exec_time,
-        cpu_energy,
-        gpu_energy,
-        ram_energy,
-        total_energy,
-        emissions_value,
-        carbon_intensity,
-        gpu_metrics,
-    )
-
+    emissions_value = None
+    energy = (None, None, None, None, None)
+    try:
+        # The inference function measures individual model forward times.
+        result = inference_fn(*args, **kwargs)
+    finally:
+        if tracker is not None:
+            stopped = tracker.stop()
+            emissions_value = float(stopped) if stopped is not None else None
+            energy = extract_energy_data(tracker, emissions_value)
+    cpu, gpu, ram, total, intensity = energy
+    return result, cpu, gpu, ram, total, emissions_value, intensity, get_gpu_metrics()
 
 # ============================================================
 # 17. QUANTUM INFERENCE
@@ -2588,10 +2408,8 @@ def build_row(
         logits
     )
 
-    total_energy = (
-        total_energy
-        or 0.0
-    )
+    energy_measured = total_energy is not None
+    total_energy = float(total_energy) if energy_measured else 0.0
 
     cpu_energy = (
         cpu_energy
@@ -2608,7 +2426,7 @@ def build_row(
         or 0.0
     )
 
-    # Same proxy as uploaded code.
+    # Legacy compatibility only: "tokens" count image pixels, NOT model tokens.
     input_tokens = int(input_pixels)
     output_tokens = 1
 
@@ -2754,16 +2572,16 @@ def build_row(
 
         # --- CodeCarbon energy ---
         "cpu_energy_kwh":
-            cpu_energy,
+            cpu_energy if energy_measured else None,
 
         "gpu_energy_kwh":
-            gpu_energy,
+            gpu_energy if energy_measured else None,
 
         "ram_energy_kwh":
-            ram_energy,
+            ram_energy if energy_measured else None,
 
         "total_energy_kwh":
-            total_energy,
+            total_energy if energy_measured else None,
 
         "total_emissions_kg":
             emissions_value,
@@ -2796,19 +2614,19 @@ def build_row(
             ),
 
         "joules_per_token":
-            joules_per_token,
+            joules_per_token if energy_measured else None,
 
         "energy_per_token_kwh":
-            energy_per_token_kwh,
+            energy_per_token_kwh if energy_measured else None,
 
         "watts_estimated":
-            watts_estimated,
+            None,  # interval energy / single inference latency would be invalid
 
         "gpu_energy_pct_of_total":
-            gpu_energy_pct,
+            gpu_energy_pct if energy_measured and total_energy > 0 else None,
 
         "cpu_energy_pct_of_total":
-            cpu_energy_pct,
+            cpu_energy_pct if energy_measured and total_energy > 0 else None,
 
         # --- CPU hardware ---
         "cpu_model":
@@ -2914,9 +2732,7 @@ def build_row(
             torch.cuda.is_available(),
 
         "device_type":
-            str(
-                DEVICE
-            ),
+            str(DEVICE),
 
         # --- RAM / memory ---
         "ram_usage_pct":
@@ -2962,7 +2778,7 @@ def build_row(
 
         # --- IMPORTANT CHANGE ---
         "quantum_computing":
-            True,
+            True,  # quantum-circuit SIMULATION, not physical QPU execution
 
         "model_under_attack":
             0,
@@ -3006,118 +2822,62 @@ def build_row(
 # 20. CSV HELPERS
 # ============================================================
 
-def get_output_path(
-    model_name,
-    dataset_name,
-):
+def checkpoint_digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()[:12]
 
-    return (
-        DEVICE_LOG_DIR
-        / (
-            f"quantum_dnn_cnn_dataset_"
-            f"{DEVICE_SHORT}_"
-            f"{dataset_name.lower()}_"
-            f"{model_name.lower()}_preproc{PREPROCESSING_VERSION}.csv"
-        )
+
+def get_output_path(model_name, dataset_name, n_qubits, checkpoint_path):
+    digest = checkpoint_digest(checkpoint_path)
+    return DEVICE_LOG_DIR / (
+        f"quantum_dnn_cnn_dataset_{DEVICE_SHORT}_{dataset_name.lower()}_"
+        f"{model_name.lower()}_{n_qubits}qubit_preproc{PREPROCESSING_VERSION}_"
+        f"checkpoint{digest}.csv"
     )
 
 
-def append_rows(
-    rows,
-    file_path,
-):
+def read_existing_results(file_path):
+    if not file_path.exists():
+        return pd.DataFrame(columns=REFERENCE_COLUMNS)
+    df = pd.read_csv(file_path)  # never silently skip malformed rows
+    missing = set(REFERENCE_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Existing CSV {file_path} missing columns: {sorted(missing)}")
+    if df['sample_index'].isna().any():
+        raise ValueError(f"Existing CSV {file_path} has null sample_index")
+    return df.reindex(columns=REFERENCE_COLUMNS)
 
+
+def append_rows(rows, file_path):
     if not rows:
         return
-
-    new_df = (
-        pd.DataFrame(
-            rows
-        )
-        .reindex(
-            columns=
-                REFERENCE_COLUMNS
-        )
-    )
-
-    if file_path.exists():
-
-        try:
-            old_df = (
-                pd.read_csv(
-                    file_path,
-                    on_bad_lines=
-                        "skip",
-                )
-            )
-
-            old_df = (
-                old_df.reindex(
-                    columns=
-                        REFERENCE_COLUMNS
-                )
-            )
-
-            pd.concat(
-                [
-                    old_df,
-                    new_df,
-                ],
-                ignore_index=True,
-            ).to_csv(
-                file_path,
-                index=False,
-            )
-
-            return
-
-        except Exception:
-            pass
-
-    new_df.to_csv(
-        file_path,
-        index=False,
-    )
+    new = pd.DataFrame(rows).reindex(columns=REFERENCE_COLUMNS)
+    old = read_existing_results(file_path)
+    if not old.empty:
+        old_keys = set(zip(old['model_type'].astype(str), old['sample_index'].astype(int)))
+        new = new.loc[[
+            (str(model), int(idx)) not in old_keys
+            for model, idx in zip(new['model_type'], new['sample_index'])
+        ]]
+    if new.empty:
+        return
+    merged = pd.concat([old, new], ignore_index=True)
+    if merged.duplicated(subset=['model_type', 'sample_index']).any():
+        raise ValueError(f"Duplicate model_type/sample_index values in {file_path}")
+    temporary = file_path.with_suffix('.tmp')
+    merged.to_csv(temporary, index=False)
+    os.replace(temporary, file_path)
 
 
-def get_existing_count(
-    file_path,
-    model_name,
-):
-
-    if not file_path.exists():
-        return 0
-
-    try:
-        df = (
-            pd.read_csv(
-                file_path,
-                on_bad_lines=
-                    "skip",
-            )
-        )
-
-        if (
-            "model_type"
-            not in df.columns
-        ):
-            return 0
-
-        return int(
-            (
-                df[
-                    "model_type"
-                ]
-                .astype(str)
-                .str.strip()
-                == model_name
-            )
-            .sum()
-        )
-
-    except Exception:
-        return 0
-
+def get_completed_indices(file_path, model_name):
+    df = read_existing_results(file_path)
+    selection = df[df['model_type'].astype(str).str.strip() == model_name]
+    if selection['sample_index'].duplicated().any():
+        raise ValueError(f"Duplicate sample indices in {file_path}")
+    return set(selection['sample_index'].astype(int))
 
 def backfill_model_metrics(
     file_path,
@@ -3244,10 +3004,9 @@ def backfill_model_metrics(
             REFERENCE_COLUMNS
     )
 
-    df.to_csv(
-        file_path,
-        index=False,
-    )
+    temporary = file_path.with_suffix('.tmp')
+    df.to_csv(temporary, index=False)
+    os.replace(temporary, file_path)
 
     print(
         f"{model_name} metrics -> "
@@ -3280,270 +3039,56 @@ def backfill_model_metrics(
 # 21. TELEMETRY COLLECTION
 # ============================================================
 
-def collect_for_model(
-    base_dataset,
-    model,
-    checkpoint_path,
-    model_name,
-    dataset_name,
-    mean,
-    std,
-    num_samples,
-    flush_every,
-    input_pixels=784,
-):
+def collect_for_model(base_dataset, model, checkpoint_path, model_name,
+                      dataset_name, mean, std, num_samples, flush_every,
+                      input_pixels=784):
+    """Resumable test-set inference; CodeCarbon estimates group-average energy.
 
-    print(
-        f"\nCollecting "
-        f"{num_samples} samples "
-        f"for {dataset_name} / "
-        f"{model_name}"
-    )
-
-    print(
-        f"Device UUID : "
-        f"{DEVICE_UUID}"
-    )
-
-    print(
-        f"Device short: "
-        f"{DEVICE_SHORT}"
-    )
-
-    output_path = (
-        get_output_path(
-            model_name,
-            dataset_name,
-        )
-    )
-
-    parameters = (
-        model.parameter_count
-    )
-
-    model_flops = (
-        compute_model_flops(
-            model,
-            DEVICE,
-        )
-    )
-
-    limit = min(
-        num_samples,
-        len(
-            base_dataset
-        ),
-    )
-
-    existing_count = (
-        get_existing_count(
-            output_path,
-            model_name,
-        )
-    )
-
-    if (
-        existing_count
-        >= limit
-    ):
-
-        print(
-            f"{model_name}: "
-            f"already complete "
-            f"({existing_count}/"
-            f"{limit})"
-        )
-
-        backfill_model_metrics(
-            output_path,
-            model_name,
-        )
-
+    CSV columns are unchanged. Energy figures for each row are amortized group
+    estimates, NOT independently observed per-example energies.
+    """
+    limit = len(base_dataset) if num_samples == 0 else min(num_samples, len(base_dataset))
+    output_path = get_output_path(model_name, dataset_name, model.n_qubits, checkpoint_path)
+    completed = get_completed_indices(output_path, model_name)
+    pending = [i for i in range(limit) if i not in completed]
+    print(f"{dataset_name}/{model_name}: {len(completed & set(range(limit)))}/{limit} done; "
+          f"{len(pending)} remaining; output={output_path}")
+    if not pending:
+        backfill_model_metrics(output_path, model_name)
         return
-
-    rows = []
-
-    print(
-        f"{model_name}: "
-        f"resuming from "
-        f"{existing_count}/"
-        f"{limit}"
-    )
-
-    progress_bar = tqdm(
-        range(
-            existing_count,
-            limit,
-        ),
-        desc=(
-            f"{model_name}"
-        ),
-        unit="sample",
-        dynamic_ncols=True,
-    )
-
     model.eval()
-
-    for i in progress_bar:
-
-        image_tensor, true_label = (
-            base_dataset[
-                i
-            ]
+    for group_start in tqdm(range(0, len(pending), flush_every), desc=f"{dataset_name}/{model_name}"):
+        ids = pending[group_start:group_start + flush_every]
+        def infer_group():
+            results = []
+            for idx in ids:
+                image, label = base_dataset[idx]  # disk decode is excluded from latency
+                start = time.perf_counter()
+                pred, logits = run_quantum_inference(model, image, mean, std)
+                elapsed = time.perf_counter() - start
+                results.append((idx, int(label), pred, logits, elapsed))
+            return results
+        results, cpu, gpu, ram, energy, emissions, intensity, gpu_metrics = run_with_energy_tracking(
+            infer_group, project_name=f"{model_name}_{dataset_name}_quantum_simulation",
+            codecarbon_filename=f"codecarbon_{dataset_name.lower()}_{model_name.lower()}.csv"
         )
-
-        (
-            (
-                prediction,
-                logits,
-            ),
-            exec_time,
-            cpu_energy,
-            gpu_energy,
-            ram_energy,
-            total_energy,
-            emissions_value,
-            carbon_intensity,
-            gpu_metrics,
-        ) = run_with_energy_tracking(
-            run_quantum_inference,
-
-            model,
-            image_tensor,
-
-            mean=mean,
-            std=std,
-
-            project_name=(
-                f"{model_name}_"
-                f"{dataset_name}_"
-                f"quantum_test"
-            ),
-
-            codecarbon_filename=(
-                f"codecarbon_"
-                f"{model_name.lower()}_"
-                f"{dataset_name.lower()}.csv"
-            ),
-        )
-
-        row = build_row(
-            model_name=
-                model_name,
-
-            prediction=
-                prediction,
-
-            exec_time=
-                exec_time,
-
-            parameters=
-                parameters,
-
-            true_label=
-                int(
-                    true_label
-                ),
-
-            sample_index=
-                i,
-
-            logits=
-                logits,
-
-            cpu_energy=
-                cpu_energy,
-
-            gpu_energy=
-                gpu_energy,
-
-            ram_energy=
-                ram_energy,
-
-            total_energy=
-                total_energy,
-
-            emissions_value=
-                emissions_value,
-
-            carbon_intensity=
-                carbon_intensity,
-
-            gpu_metrics=
-                gpu_metrics,
-
-            model_flops=
-                model_flops,
-
-            dataset_name=
-                dataset_name,
-
-            checkpoint_path=
-                checkpoint_path,
-
-            n_qubits=
-                model.n_qubits,
-
-            fidelity=
-                None,
-            input_pixels=input_pixels,
-        )
-
-        rows.append(
-            row
-        )
-
-        progress_bar.set_postfix({
-            "pred":
-                prediction,
-
-            "true":
-                int(
-                    true_label
-                ),
-
-            "time_s":
-                round(
-                    exec_time,
-                    3,
-                ),
-
-            "done":
-                i + 1,
-        })
-
-        if (
-            (i + 1)
-            % flush_every
-            == 0
-        ):
-
-            append_rows(
-                rows,
-                output_path,
-            )
-
-            rows = []
-
-    if rows:
-        append_rows(
-            rows,
-            output_path,
-        )
-
-    backfill_model_metrics(
-        output_path,
-        model_name,
-    )
-
-    print(
-        f"{model_name}: "
-        f"finished "
-        f"{limit}/{limit} "
-        f"-> "
-        f"{output_path}"
-    )
-
+        size = len(results)
+        def per_sample(value):
+            return None if value is None else float(value) / size
+        rows = [build_row(
+            model_name=model_name, prediction=pred, exec_time=elapsed,
+            parameters=model.parameter_count, true_label=label,
+            sample_index=idx, logits=logits,
+            cpu_energy=per_sample(cpu), gpu_energy=per_sample(gpu),
+            ram_energy=per_sample(ram), total_energy=per_sample(energy),
+            emissions_value=per_sample(emissions), carbon_intensity=intensity,
+            gpu_metrics=gpu_metrics, model_flops=None, dataset_name=dataset_name,
+            checkpoint_path=checkpoint_path, n_qubits=model.n_qubits,
+            fidelity=None, input_pixels=input_pixels,
+        ) for idx, label, pred, logits, elapsed in results]
+        append_rows(rows, output_path)
+    backfill_model_metrics(output_path, model_name)
+    print(f"Saved {limit} predictions: {output_path}")
 
 # ============================================================
 # 22. MAIN
@@ -3561,14 +3106,16 @@ def main():
     print("FOUR-LAYER QUANTUM CNN/DNN SIMULATOR TELEMETRY")
     print("Datasets:", selected)
     print(f"Qubits: CNN={CNN_QUBITS}, DNN={DNN_QUBITS}; layers={N_LAYERS}")
-    print(f"Train samples={TRAIN_SAMPLES}, epochs={TRAIN_EPOCHS}; test samples={NUM_TEST_SAMPLES}")
+    print(f"Train samples={'ALL' if TRAIN_SAMPLES == 0 else TRAIN_SAMPLES}, "
+          f"epochs={TRAIN_EPOCHS}; test samples={'ALL' if NUM_TEST_SAMPLES == 0 else NUM_TEST_SAMPLES}")
+    print(f"Validation fraction={VALIDATION_FRACTION}; energy estimates amortized per {FLUSH_EVERY} samples")
     print("Device:", DEVICE, " PennyLane:", PENNYLANE_DEVICE)
     print("Preprocessing version:", PREPROCESSING_VERSION)
 
-    if DEVICE.type != "cpu" and PENNYLANE_DEVICE == "default.qubit":
+    if DEVICE.type != "cpu":
         raise RuntimeError(
-            "default.qubit runs on CPU. Set DEVICE_MODE=cpu for consistent "
-            "PyTorch/PennyLane tensors and valid CPU-side telemetry."
+            "This script supports CPU simulation only. Set DEVICE_MODE=cpu for "
+            "consistent tensors and valid CPU-side telemetry."
         )
 
     for dataset_name in selected:
