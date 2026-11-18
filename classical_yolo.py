@@ -4,12 +4,16 @@ YOLO26n image classification telemetry: MNIST, FashionMNIST, KMNIST, CIFAR100, T
 
 This script:
 1. Loads existing YOLO26n classification checkpoints, or trains if missing.
-2. Tests all five datasets with the same 83-column telemetry schema.
-3. Never trains on official held-out test/validation images.
-4. Skips completed CSVs, and resumes unfinished CSVs without duplicates.
-5. Backfills multiclass Accuracy / Precision / Recall / F1.
+2. Trains on 100% of the official training split for 10 epochs by default.
+3. Tests all five datasets with the same 83-column telemetry schema.
+4. Never trains on official held-out test/validation images.
+5. Skips completed CSVs, and resumes unfinished CSVs without duplicates.
+6. Backfills multiclass Accuracy / Precision / Recall / F1.
 
-Checkpoints saved to current directory as yolo26n_<dataset>_cpu.pt.
+New checkpoints saved as yolo26n_<dataset>_fulltrain10e_cpu.pt by default.
+Ultralytics classification expects a val directory; this script points val to train
+ONLY for dataset compatibility and sets val=False. It does not hold out data.
+The last-epoch checkpoint is used, never the validation-selected best checkpoint.
 Tiny ImageNet requires an extracted tiny-imagenet-200 directory.
 """
 
@@ -110,7 +114,7 @@ DATASET_CONFIGS = {
     "TinyImageNet200": {"dataset_class": None, "key": "tinyimagenet200", "num_classes": 200, "image_size": 64},
 }
 for _name, _cfg in DATASET_CONFIGS.items():
-    _cfg["yolo_checkpoint"] = CHECKPOINT_ROOT / f"yolo26n_{_cfg['key']}_cpu.pt"
+    _cfg["yolo_checkpoint"] = CHECKPOINT_ROOT / f"yolo26n_{_cfg['key']}_fulltrain{TRAIN_EPOCHS}e_cpu.pt"
 
 if any(name not in DATASET_CONFIGS for name in DATASETS):
     raise ValueError(f"Unknown DATASETS selection: {DATASETS}")
@@ -1710,33 +1714,31 @@ def load_raw_train_dataset(dataset_name):
 
 
 def prepare_yolo_training_folders(dataset_name):
-    """Materialize deterministic 90/10 split of the OFFICIAL training set only.
+    """Prepare ALL official training images, without holding out validation data.
 
-    Ultralytics image classification expects train/classname/img and val/classname/img.
-    We use zero-padded integer class names to preserve label index mapping.
-    On Tiny ImageNet, hardlinks avoid duplicating JPEG bytes on the same filesystem.
+    Some Ultralytics classification versions require both train/ and val/
+    directories even if validation is disabled. The val directory is therefore
+    an alias of train, NOT an independent validation set; val=False is passed
+    to training, and the final (last.pt) checkpoint is selected.
     """
     cfg = DATASET_CONFIGS[dataset_name]
-    destination = CLASSIFY_DATA_ROOT / cfg["key"]
+    destination = CLASSIFY_DATA_ROOT / cfg["key"] / "full_training_v3"
     marker = destination / ".complete.json"
     dataset = load_raw_train_dataset(dataset_name)
-    if len(dataset) == 0:
+    if not len(dataset):
         raise ValueError(f"Empty training set: {dataset_name}")
     manifest = {
         "dataset": dataset_name,
         "count": len(dataset),
         "num_classes": cfg["num_classes"],
-        "seed": SEED,
-        "train_fraction": 0.9,
-        "format_version": 2,
+        "train_fraction": 1.0,
+        "validation_fraction": 0.0,
+        "format_version": 3,
     }
-    if marker.exists():
-        try:
-            if json.loads(marker.read_text()) == manifest:
-                print(f"[DATA] Reusing prepared classification folders: {destination}")
-                return destination
-        except (ValueError, OSError):
-            pass
+    if marker.is_file() and (destination / "train").is_dir() and (destination / "val").is_dir():
+        if json.loads(marker.read_text()) == manifest:
+            print(f"[DATA] Reusing full training folders: {destination}")
+            return destination
     if destination.exists():
         shutil.rmtree(destination)
 
@@ -1745,36 +1747,45 @@ def prepare_yolo_training_folders(dataset_name):
     for i, y in enumerate(labels):
         per_class[int(y)].append(i)
     if set(per_class) != set(range(cfg["num_classes"])):
-        raise ValueError(f"Not all {cfg['num_classes']} classes present in {dataset_name} train split")
-    rng = random.Random(SEED)
-    items = []
-    for cls, ids in per_class.items():
-        rng.shuffle(ids)
-        n_val = max(1, int(round(0.1 * len(ids))))
-        for index in ids[n_val:]:
-            items.append(("train", cls, index))
-        for index in ids[:n_val]:
-            items.append(("val", cls, index))
+        raise ValueError(f"Some classes are missing from {dataset_name} training data")
 
-    print(f"[DATA] Preparing {dataset_name}: {len(items)} training-source images; no test images")
-    for split, cls, idx in tqdm(items, desc=f"Prepare {dataset_name}", unit="image"):
-        folder = destination / split / f"{cls:03d}"
+    train_dir = destination / "train"
+    print(f"[DATA] Preparing ALL {len(dataset):,} official training images for {dataset_name}")
+    for cls, indices in per_class.items():
+        folder = train_dir / f"{cls:03d}"
         folder.mkdir(parents=True, exist_ok=True)
-        if dataset_name == "TinyImageNet200":
-            source, source_cls = dataset.samples[idx]
-            if int(source_cls) != cls:
-                raise AssertionError("Tiny ImageNet class mismatch")
-            target = folder / f"image_{idx:06d}{Path(source).suffix.lower()}"
-            try:
-                os.link(source, target)
-            except OSError:
-                shutil.copy2(source, target)
-        else:
-            image, real_cls = dataset[idx]
-            if int(real_cls) != cls:
-                raise AssertionError("Torchvision class mismatch")
-            target = folder / f"image_{idx:06d}.png"
-            image.convert("RGB").save(target)
+        for idx in tqdm(indices, desc=f"{dataset_name} class {cls}", leave=False):
+            if dataset_name == "TinyImageNet200":
+                source, source_cls = dataset.samples[idx]
+                if int(source_cls) != cls:
+                    raise AssertionError("Tiny ImageNet class mismatch")
+                target = folder / f"image_{idx:06d}{Path(source).suffix.lower()}"
+                try:
+                    os.link(source, target)
+                except OSError:
+                    shutil.copy2(source, target)
+            else:
+                image, real_cls = dataset[idx]
+                if int(real_cls) != cls:
+                    raise AssertionError("Torchvision class mismatch")
+                image.convert("RGB").save(folder / f"image_{idx:06d}.png")
+
+    # Ultralytics expects a val directory even when val=False.
+    # Prefer a symlink: no extra image copies. Windows without symlink permission
+    # falls back to hardlinks (or copies if cross-filesystem).
+    val_dir = destination / "val"
+    try:
+        val_dir.symlink_to(train_dir.resolve(), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        for folder in train_dir.iterdir():
+            alias = val_dir / folder.name
+            alias.mkdir(parents=True, exist_ok=True)
+            for source in folder.iterdir():
+                target = alias / source.name
+                try:
+                    os.link(source, target)
+                except OSError:
+                    shutil.copy2(source, target)
     marker.write_text(json.dumps(manifest, indent=2))
     return destination
 
@@ -1792,13 +1803,14 @@ def ensure_yolo_checkpoint(dataset_name):
     print(f"[TRAIN] Missing checkpoint: {checkpoint}; training {dataset_name}")
     training_folder = prepare_yolo_training_folders(dataset_name)
     train_device = 0 if (DEVICE.type == "cuda") else "cpu"
-    run_name = f"{cfg['key']}_yolo26n_cls"
+    run_name = f"{cfg['key']}_yolo26n_cls_fulltrain{TRAIN_EPOCHS}e"
     run_root = Path.cwd() / "yolo_training_runs"
     # Initialize a classification model from its architecture (not a detection model).
     model = YOLO("yolo26n-cls.yaml")
     model.train(
         data=str(training_folder.resolve()),
         epochs=TRAIN_EPOCHS,
+        val=False,  # no independent validation and no validation-based selection
         imgsz=TRAIN_IMGSZ,
         batch=TRAIN_BATCH_SIZE,
         device=train_device,
@@ -1810,11 +1822,11 @@ def ensure_yolo_checkpoint(dataset_name):
         plots=False,
         verbose=False,
     )
-    best = run_root / run_name / "weights" / "best.pt"
-    if not best.is_file():
-        raise FileNotFoundError(f"Ultralytics training finished without best.pt at {best}")
+    last = run_root / run_name / "weights" / "last.pt"
+    if not last.is_file():
+        raise FileNotFoundError(f"Ultralytics training finished without last.pt at {last}")
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(best, checkpoint)
+    shutil.copy2(last, checkpoint)
     print(f"[TRAIN] Checkpoint saved: {checkpoint}")
     return checkpoint
 
@@ -2072,7 +2084,7 @@ def test_model(
         checkpoint_path,
     )
 
-    output_path = DEVICE_LOG_DIR / f"{model_name.lower()}_{dataset_key}_test_telemetry.csv"
+    output_path = DEVICE_LOG_DIR / f"{model_name.lower()}_{dataset_key}_fulltrain{TRAIN_EPOCHS}e_test_telemetry.csv"
     rows = []
     completed = set()
     if output_path.is_file():
@@ -2197,7 +2209,7 @@ def test_model(
         / (
             f"{model_name.lower()}_"
             f"{dataset_key}_"
-            f"test_telemetry.csv"
+            f"fulltrain{TRAIN_EPOCHS}e_test_telemetry.csv"
         )
     )
 
