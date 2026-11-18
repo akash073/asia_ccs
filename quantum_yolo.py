@@ -1,3 +1,6 @@
+# Full official training split is used by default (TRAIN_SAMPLES=0,
+# VALIDATION_FRACTION=0). Existing partial-run checkpoints remain separate.
+# Official test/validation split is reserved for telemetry evaluation.
 """Hybrid YOLO26n classification + PennyLane 4-layer VQC.
 Supports MNIST, FashionMNIST, KMNIST, CIFAR100 and TinyImageNet200.
 Auto-trains missing dataset-specific checkpoints; evaluates official held-out splits.
@@ -29,8 +32,9 @@ TINY_ROOT=Path(os.getenv('TINY_IMAGENET_ROOT',str(DATA_ROOT/'tiny-imagenet-200')
 CHECKPOINT_DIR=Path(os.getenv('CHECKPOINT_DIR','./quantum_checkpoints'))
 CHECKPOINT_DIR.mkdir(parents=True,exist_ok=True)
 EPOCHS=int(os.getenv('TRAIN_EPOCHS','10'))
-TRAIN_SAMPLES=int(os.getenv('TRAIN_SAMPLES','2000'))  # 0 means all
-NUM_TEST_SAMPLES=int(os.getenv('NUM_TEST_SAMPLES','10'))  # 0 means all
+TRAIN_SAMPLES=int(os.getenv('TRAIN_SAMPLES','0'))  # 0 = entire official training split (default)
+NUM_TEST_SAMPLES=int(os.getenv('NUM_TEST_SAMPLES','10'))  # 0 = entire held-out test split
+VALIDATION_FRACTION=float(os.getenv('VALIDATION_FRACTION','0'))  # 0 = no holdout from training (default)
 TRAIN_BATCH_SIZE=int(os.getenv('TRAIN_BATCH_SIZE','8'))
 NUM_WORKERS=int(os.getenv('NUM_WORKERS','0'))
 LR=float(os.getenv('LEARNING_RATE','0.001'))
@@ -52,6 +56,7 @@ DATASET_CONFIGS={
 }
 assert N_QUBITS>=1 and TRAIN_BATCH_SIZE>=1 and IMG_SIZE>=32
 assert EPOCHS>=1 and NUM_TEST_SAMPLES>=0 and TRAIN_SAMPLES>=0
+assert 0 <= VALIDATION_FRACTION < 1
 if not set(SELECTED_DATASETS).issubset(DATASET_CONFIGS):
  raise ValueError(f'Invalid datasets: {SELECTED_DATASETS}')
 
@@ -98,14 +103,23 @@ def make_loaders(name):
   idx=rng.choice(len(all_train),size=TRAIN_SAMPLES,replace=False).tolist()
   all_train=Subset(all_train,idx)
  n=len(all_train)
- if n<3: raise ValueError('Need at least 3 training images')
- n_val=max(1,round(n*0.1))
- train,val=torch.utils.data.random_split(all_train,[n-n_val,n_val],generator=torch.Generator().manual_seed(SEED))
+ if n<1: raise ValueError('No training images found')
+ # Default: use the COMPLETE official training split without a validation holdout.
+ if VALIDATION_FRACTION > 0:
+  if n<2: raise ValueError('At least two images required for a validation split')
+  n_val=max(1,round(n*VALIDATION_FRACTION))
+  n_val=min(n_val,n-1)
+  train,val=torch.utils.data.random_split(all_train,[n-n_val,n_val],generator=torch.Generator().manual_seed(SEED))
+ else:
+  train,val=all_train,None
  test=get_dataset(name,False)
  if NUM_TEST_SAMPLES: test=Subset(test,range(min(NUM_TEST_SAMPLES,len(test))))
  kw=dict(batch_size=TRAIN_BATCH_SIZE,num_workers=NUM_WORKERS)
- return (DataLoader(train,shuffle=True,**kw),DataLoader(val,shuffle=False,**kw),
-         DataLoader(test,shuffle=False,**kw))
+ train_loader=DataLoader(train,shuffle=True,**kw)
+ val_loader=DataLoader(val,shuffle=False,**kw) if val is not None else None
+ test_loader=DataLoader(test,shuffle=False,**kw)
+ print(f'{name}: training={len(train)}, validation={len(val) if val is not None else 0}, test={len(test)}')
+ return train_loader,val_loader,test_loader
 
 # Each qnode is executed sample-by-sample, with four trainable layers.
 def make_qnode(n_qubits):
@@ -173,16 +187,17 @@ def get_logits(output,n_classes):
    if key in output: return get_logits(output[key],n_classes)
  raise RuntimeError(f'Unexpected YOLO logits format: {type(output)}')
 
-def checkpoint_path(dataset_key):
- return CHECKPOINT_DIR/f'hybrid_yolo26n_{dataset_key}_{N_QUBITS}q_{N_Q_LAYERS}layers_{IMG_SIZE}px_v2.pth'
+def checkpoint_path(dataset_key, train_count):
+ return CHECKPOINT_DIR/f'hybrid_yolo26n_{dataset_key}_{N_QUBITS}q_{N_Q_LAYERS}layers_{IMG_SIZE}px_train{train_count}_v3.pth'
 
 def load_or_train(name,key,n_classes,train_loader,val_loader):
- path=checkpoint_path(key)
+ train_count=len(train_loader.dataset)
+ path=checkpoint_path(key,train_count)
  model=build_model(n_classes)
  if path.exists() and not FORCE_RETRAIN:
   try: ck=torch.load(path,map_location='cpu',weights_only=True)
   except TypeError: ck=torch.load(path,map_location='cpu')
-  if ck.get('n_classes')!=n_classes or ck.get('n_qubits')!=N_QUBITS:
+  if ck.get('n_classes')!=n_classes or ck.get('n_qubits')!=N_QUBITS or ck.get('train_count')!=train_count:
    raise RuntimeError(f'Checkpoint shape mismatch: {path}')
   model.load_state_dict(ck['state_dict'],strict=True)
   print(f'Loaded {path}')
@@ -200,16 +215,25 @@ def load_or_train(name,key,n_classes,train_loader,val_loader):
    loss=loss_fn(logits,y)
    loss.backward(); opt.step()
    train_ok+=int((logits.argmax(1)==y).sum()); train_n+=len(y)
-  model.eval(); val_ok=val_n=0
-  with torch.no_grad():
-   for x,y in val_loader:
-    logits=get_logits(model(x.to(DEVICE)),n_classes)
-    val_ok+=int((logits.argmax(1)==y.to(DEVICE)).sum()); val_n+=len(y)
-  val_acc=val_ok/max(val_n,1)
-  print(f'{name} epoch={epoch} train_acc={train_ok/max(train_n,1):.4f} val_acc={val_acc:.4f}')
-  if val_acc>best:
-   best=val_acc
-   torch.save({'state_dict':model.state_dict(),'n_classes':n_classes,'n_qubits':N_QUBITS,'epoch':epoch,'val_acc':val_acc},path)
+  train_acc=train_ok/max(train_n,1)
+  if val_loader is not None:
+   model.eval(); val_ok=val_n=0
+   with torch.no_grad():
+    for x,y in val_loader:
+     logits=get_logits(model(x.to(DEVICE)),n_classes)
+     val_ok+=int((logits.argmax(1)==y.to(DEVICE)).sum()); val_n+=len(y)
+   val_acc=val_ok/max(val_n,1)
+   print(f'{name} epoch={epoch} train_acc={train_acc:.4f} val_acc={val_acc:.4f}')
+   should_save=val_acc>best
+   if should_save: best=val_acc
+  else:
+   val_acc=None
+   should_save=True  # Without validation, save the latest fully trained epoch.
+   print(f'{name} epoch={epoch} train_acc={train_acc:.4f} (full training; no validation holdout)')
+  if should_save:
+   torch.save({'state_dict':model.state_dict(),'n_classes':n_classes,
+               'n_qubits':N_QUBITS,'epoch':epoch,'val_acc':val_acc,
+               'train_count':train_count,'validation_fraction':VALIDATION_FRACTION},path)
  try: ck=torch.load(path,map_location='cpu',weights_only=True)
  except TypeError: ck=torch.load(path,map_location='cpu')
  model.load_state_dict(ck['state_dict'],strict=True)
@@ -590,7 +614,7 @@ def backfill_from_csv(output_path,n_classes):
 def test_model(name,key,n_classes,model,test_loader,path):
  model.eval()
  label=f'HybridYOLO26n-{N_QUBITS}Q'
- out=DEVICE_LOG_DIR/f'yolo26n_{key}_{N_QUBITS}qubit_{IMG_SIZE}px_v2_test_telemetry.csv'
+ out=DEVICE_LOG_DIR/f'yolo26n_{key}_{N_QUBITS}qubit_{IMG_SIZE}px_{path.stem.split("_")[-2]}_v3_test_telemetry.csv'
  # Skip rows by stable test-set sample index, not row counts.
  done=set()
  if out.is_file():

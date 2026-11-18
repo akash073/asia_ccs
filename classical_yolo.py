@@ -1,23 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-YOLO classification + MobileNetV2 telemetry test
-Datasets: MNIST, FashionMNIST, KMNIST
+YOLO26n image classification telemetry: MNIST, FashionMNIST, KMNIST, CIFAR100, TinyImageNet200
 
 This script:
-1. Loads the PREVIOUSLY SAVED trained models.
-2. Tests MNIST, FashionMNIST, and KMNIST.
-3. Uses the exact same 83 telemetry columns as the reference CNN/DNN test.
-4. Saves one CSV per model/dataset.
-5. Backfills Accuracy / Precision / Recall / F1 into every row.
+1. Loads existing YOLO26n classification checkpoints, or trains if missing.
+2. Tests all five datasets with the same 83-column telemetry schema.
+3. Never trains on official held-out test/validation images.
+4. Skips completed CSVs, and resumes unfinished CSVs without duplicates.
+5. Backfills multiclass Accuracy / Precision / Recall / F1.
 
-Expected saved models:
-    yolo26n_mnist_cpu.pt
-    yolo26n_fashionmnist_cpu.pt
-    yolo26n_kmnist_cpu.pt
-
-    mobilenet_v2_mnist_cpu.pt
-    mobilenet_v2_fashionmnist_cpu.pt
-    mobilenet_v2_kmnist_cpu.pt
+Checkpoints saved to current directory as yolo26n_<dataset>_cpu.pt.
+Tiny ImageNet requires an extracted tiny-imagenet-200 directory.
 """
 
 from __future__ import annotations
@@ -28,7 +21,12 @@ import platform
 import socket
 import sys
 import time
+import json
+import random
+import shutil
+from collections import defaultdict
 from pathlib import Path
+from PIL import Image
 
 import pandas as pd
 import psutil
@@ -44,10 +42,6 @@ from sklearn.metrics import (
 )
 
 from torchvision import datasets, transforms
-from torchvision.models import (
-    mobilenet_v2,
-    MobileNet_V2_Weights,
-)
 from tqdm.auto import tqdm
 from ultralytics import YOLO
 
@@ -86,7 +80,17 @@ else:
     DEVICE = torch.device("cpu")
 
 
-DATA_ROOT = Path("../classical_data")
+DATA_ROOT = Path(os.getenv("DATA_ROOT", "./data"))
+CHECKPOINT_ROOT = Path(os.getenv("CHECKPOINT_ROOT", "."))
+TINY_IMAGENET_ROOT = Path(os.getenv("TINY_IMAGENET_ROOT", str(DATA_ROOT / "tiny-imagenet-200")))
+DATASETS = [x.strip() for x in os.getenv("DATASETS", "MNIST,FashionMNIST,KMNIST,CIFAR100,TinyImageNet200").split(",") if x.strip()]
+TRAIN_EPOCHS = int(os.getenv("TRAIN_EPOCHS", "10"))
+TRAIN_BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "64"))
+TRAIN_IMGSZ = int(os.getenv("TRAIN_IMGSZ", "64"))
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "0"))
+SEED = int(os.getenv("SEED", "42"))
+CLASSIFY_DATA_ROOT = Path(os.getenv("YOLO_CLASSIFY_DATA_ROOT", str(DATA_ROOT / "yolo_classification_prepared")))
+
 
 OUTPUT_ROOT = Path.cwd() / "test_results"
 OUTPUT_ROOT.mkdir(
@@ -98,42 +102,18 @@ OUTPUT_ROOT.mkdir(
 # ============================================================
 # 2. DATASET CONFIGURATION
 # ============================================================
-
 DATASET_CONFIGS = {
-    "MNIST": {
-        "dataset_class":
-            datasets.MNIST,
-
-        "key":
-            "mnist",
-
-        "yolo_checkpoint":
-            Path("../yolo26n_mnist_cpu.pt"),
-    },
-
-    "FashionMNIST": {
-        "dataset_class":
-            datasets.FashionMNIST,
-
-        "key":
-            "fashionmnist",
-
-        "yolo_checkpoint":
-            Path("../yolo26n_fashionmnist_cpu.pt"),
-
-    },
-
-    "KMNIST": {
-        "dataset_class":
-            datasets.KMNIST,
-
-        "key":
-            "kmnist",
-
-        "yolo_checkpoint":
-            Path("../yolo26n_kmnist_cpu.pt"),
-    },
+    "MNIST": {"dataset_class": datasets.MNIST, "key": "mnist", "num_classes": 10, "image_size": 28},
+    "FashionMNIST": {"dataset_class": datasets.FashionMNIST, "key": "fashionmnist", "num_classes": 10, "image_size": 28},
+    "KMNIST": {"dataset_class": datasets.KMNIST, "key": "kmnist", "num_classes": 10, "image_size": 28},
+    "CIFAR100": {"dataset_class": datasets.CIFAR100, "key": "cifar100", "num_classes": 100, "image_size": 32},
+    "TinyImageNet200": {"dataset_class": None, "key": "tinyimagenet200", "num_classes": 200, "image_size": 64},
 }
+for _name, _cfg in DATASET_CONFIGS.items():
+    _cfg["yolo_checkpoint"] = CHECKPOINT_ROOT / f"yolo26n_{_cfg['key']}_cpu.pt"
+
+if any(name not in DATASET_CONFIGS for name in DATASETS):
+    raise ValueError(f"Unknown DATASETS selection: {DATASETS}")
 
 
 # ============================================================
@@ -1250,6 +1230,7 @@ def build_row(
     model_flops,
     dataset_name,
     checkpoint_path,
+    input_tokens,
 ):
 
     (
@@ -1280,9 +1261,7 @@ def build_row(
         or 0.0
     )
 
-    # For exact schema compatibility with the user's existing
-    # CNN/DNN telemetry, use the same 784-pixel proxy.
-    input_tokens = 784
+    # Proxy token count equals image pixel/channel count, not LLM tokens.
     output_tokens = 1
 
     total_tokens = (
@@ -1672,258 +1651,207 @@ def build_row(
 
 
 # ============================================================
-# 12. DATASETS
+# 12. DATASETS, SPLITS AND YOLO CLASSIFICATION FOLDERS
 # ============================================================
+class TinyImageNetValidation(torch.utils.data.Dataset):
+    """Official Tiny ImageNet validation images, mapped to sorted WNID indices."""
+    def __init__(self, root):
+        root = Path(root)
+        wnids = root / "wnids.txt"
+        annotations = root / "val" / "val_annotations.txt"
+        if not wnids.is_file() or not annotations.is_file():
+            raise FileNotFoundError(f"Tiny ImageNet needs {wnids} and {annotations}")
+        self.wnids = sorted(x.strip() for x in wnids.read_text().splitlines() if x.strip())
+        if len(self.wnids) != 200:
+            raise ValueError(f"Expected 200 WNIDs, found {len(self.wnids)}")
+        self.class_to_idx = {w: i for i, w in enumerate(self.wnids)}
+        self.samples = []
+        for line in annotations.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in self.class_to_idx:
+                path = root / "val" / "images" / parts[0]
+                if path.is_file():
+                    self.samples.append((path, self.class_to_idx[parts[1]]))
+        if not self.samples:
+            raise FileNotFoundError("No Tiny ImageNet validation images found")
 
-def load_raw_test_dataset(
-    dataset_class,
-):
+    def __len__(self):
+        return len(self.samples)
 
-    # Keep PIL images.
-    # Each model applies its own preprocessing.
-    return dataset_class(
-        root=DATA_ROOT,
-        train=False,
-        download=True,
-        transform=None,
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        with Image.open(path) as image:
+            return image.convert("RGB"), label
+
+
+def load_raw_test_dataset(dataset_name):
+    """Official test sets for torchvision; labeled official val for Tiny ImageNet."""
+    if dataset_name == "TinyImageNet200":
+        return TinyImageNetValidation(TINY_IMAGENET_ROOT)
+    return DATASET_CONFIGS[dataset_name]["dataset_class"](
+        root=str(DATA_ROOT), train=False, download=True, transform=None,
     )
 
 
-# ============================================================
-# 13. MOBILENETV2
-# ============================================================
-
-MOBILENET_TRANSFORM = (
-    transforms.Compose([
-        transforms.Resize(
-            (224, 224)
-        ),
-
-        transforms.Grayscale(
-            num_output_channels=3
-        ),
-
-        transforms.ToTensor(),
-
-        transforms.Normalize(
-            mean=(
-                0.485,
-                0.456,
-                0.406,
-            ),
-            std=(
-                0.229,
-                0.224,
-                0.225,
-            ),
-        ),
-    ])
-)
-
-
-def load_mobilenet(
-    checkpoint_path,
-):
-
-    if not checkpoint_path.exists():
-
-        raise FileNotFoundError(
-            f"MobileNetV2 checkpoint "
-            f"not found: "
-            f"{checkpoint_path}"
-        )
-
-    # IMPORTANT:
-    # weights=None prevents another ImageNet
-    # download. The trained state_dict below
-    # contains the saved learned parameters.
-    model = (
-        mobilenet_v2(
-            weights=None
-        )
-    )
-
-    in_features = (
-        model.classifier[1]
-        .in_features
-    )
-
-    model.classifier[1] = (
-        nn.Linear(
-            in_features,
-            10,
-        )
-    )
-
-    state = torch.load(
-        checkpoint_path,
-        map_location=DEVICE,
-    )
-
-    model.load_state_dict(
-        state
-    )
-
-    model = model.to(
-        DEVICE
-    )
-
-    model.eval()
-
-    parameters = int(
-        sum(
-            p.numel()
-            for p
-            in model.parameters()
-        )
-    )
-
-    return (
-        model,
-        parameters,
+def load_raw_train_dataset(dataset_name):
+    """Only actual training images; NEVER official validation or test images."""
+    if dataset_name == "TinyImageNet200":
+        train_root = TINY_IMAGENET_ROOT / "train"
+        if not train_root.is_dir():
+            raise FileNotFoundError(f"Missing Tiny ImageNet train folder: {train_root}")
+        ds = datasets.ImageFolder(str(train_root))
+        official = sorted(x.strip() for x in (TINY_IMAGENET_ROOT / "wnids.txt").read_text().splitlines() if x.strip())
+        if list(ds.classes) != official:
+            raise ValueError("Tiny ImageNet training class ordering does not match sorted WNID labels")
+        return ds
+    return DATASET_CONFIGS[dataset_name]["dataset_class"](
+        root=str(DATA_ROOT), train=True, download=True, transform=None,
     )
 
 
-def run_mobilenet_inference(
-    model,
-    image,
-):
+def prepare_yolo_training_folders(dataset_name):
+    """Materialize deterministic 90/10 split of the OFFICIAL training set only.
 
-    input_tensor = (
-        MOBILENET_TRANSFORM(
-            image
-        )
-        .unsqueeze(0)
-        .to(
-            DEVICE
-        )
-    )
+    Ultralytics image classification expects train/classname/img and val/classname/img.
+    We use zero-padded integer class names to preserve label index mapping.
+    On Tiny ImageNet, hardlinks avoid duplicating JPEG bytes on the same filesystem.
+    """
+    cfg = DATASET_CONFIGS[dataset_name]
+    destination = CLASSIFY_DATA_ROOT / cfg["key"]
+    marker = destination / ".complete.json"
+    dataset = load_raw_train_dataset(dataset_name)
+    if len(dataset) == 0:
+        raise ValueError(f"Empty training set: {dataset_name}")
+    manifest = {
+        "dataset": dataset_name,
+        "count": len(dataset),
+        "num_classes": cfg["num_classes"],
+        "seed": SEED,
+        "train_fraction": 0.9,
+        "format_version": 2,
+    }
+    if marker.exists():
+        try:
+            if json.loads(marker.read_text()) == manifest:
+                print(f"[DATA] Reusing prepared classification folders: {destination}")
+                return destination
+        except (ValueError, OSError):
+            pass
+    if destination.exists():
+        shutil.rmtree(destination)
 
-    with torch.inference_mode():
+    labels = dataset.targets
+    per_class = defaultdict(list)
+    for i, y in enumerate(labels):
+        per_class[int(y)].append(i)
+    if set(per_class) != set(range(cfg["num_classes"])):
+        raise ValueError(f"Not all {cfg['num_classes']} classes present in {dataset_name} train split")
+    rng = random.Random(SEED)
+    items = []
+    for cls, ids in per_class.items():
+        rng.shuffle(ids)
+        n_val = max(1, int(round(0.1 * len(ids))))
+        for index in ids[n_val:]:
+            items.append(("train", cls, index))
+        for index in ids[:n_val]:
+            items.append(("val", cls, index))
 
-        logits = (
-            model(
-                input_tensor
-            )
-        )
-
-    prediction = int(
-        torch.argmax(
-            logits,
-            dim=1,
-        ).item()
-    )
-
-    return (
-        prediction,
-        logits.detach(),
-    )
+    print(f"[DATA] Preparing {dataset_name}: {len(items)} training-source images; no test images")
+    for split, cls, idx in tqdm(items, desc=f"Prepare {dataset_name}", unit="image"):
+        folder = destination / split / f"{cls:03d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        if dataset_name == "TinyImageNet200":
+            source, source_cls = dataset.samples[idx]
+            if int(source_cls) != cls:
+                raise AssertionError("Tiny ImageNet class mismatch")
+            target = folder / f"image_{idx:06d}{Path(source).suffix.lower()}"
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+        else:
+            image, real_cls = dataset[idx]
+            if int(real_cls) != cls:
+                raise AssertionError("Torchvision class mismatch")
+            target = folder / f"image_{idx:06d}.png"
+            image.convert("RGB").save(target)
+    marker.write_text(json.dumps(manifest, indent=2))
+    return destination
 
 
 # ============================================================
-# 14. YOLO CLASSIFICATION
+# 13. YOLO TRAINING SUPPORT
 # ============================================================
+def ensure_yolo_checkpoint(dataset_name):
+    cfg = DATASET_CONFIGS[dataset_name]
+    checkpoint = cfg["yolo_checkpoint"]
+    if checkpoint.is_file():
+        print(f"[MODEL] Loading existing checkpoint: {checkpoint}")
+        return checkpoint
 
-def load_yolo(
-    checkpoint_path,
-):
-
-    if not checkpoint_path.exists():
-
-        raise FileNotFoundError(
-            f"YOLO checkpoint "
-            f"not found: "
-            f"{checkpoint_path}"
-        )
-
-    model = YOLO(
-        str(
-            checkpoint_path
-        )
-    )
-
-    # Underlying PyTorch model.
-    torch_model = (
-        model.model
-    )
-
-    torch_model.to(
-        DEVICE
-    )
-
-    torch_model.eval()
-
-    parameters = int(
-        sum(
-            p.numel()
-            for p
-            in torch_model.parameters()
-        )
-    )
-
-    return (
-        model,
-        parameters,
-    )
-
-
-def run_yolo_inference(
-    model,
-    image,
-):
-
-    # Training images were converted to RGB.
-    image = image.convert(
-        "RGB"
-    )
-
-    # Ultralytics classification result.
-    results = model.predict(
-        source=image,
-        imgsz=64,
-        device=(
-            0
-            if DEVICE.type == "cuda"
-            else "cpu"
-        ),
+    print(f"[TRAIN] Missing checkpoint: {checkpoint}; training {dataset_name}")
+    training_folder = prepare_yolo_training_folders(dataset_name)
+    train_device = 0 if (DEVICE.type == "cuda") else "cpu"
+    run_name = f"{cfg['key']}_yolo26n_cls"
+    run_root = Path.cwd() / "yolo_training_runs"
+    # Initialize a classification model from its architecture (not a detection model).
+    model = YOLO("yolo26n-cls.yaml")
+    model.train(
+        data=str(training_folder.resolve()),
+        epochs=TRAIN_EPOCHS,
+        imgsz=TRAIN_IMGSZ,
+        batch=TRAIN_BATCH_SIZE,
+        device=train_device,
+        workers=NUM_WORKERS,
+        seed=SEED,
+        project=str(run_root.resolve()),
+        name=run_name,
+        exist_ok=True,
+        plots=False,
         verbose=False,
     )
+    best = run_root / run_name / "weights" / "best.pt"
+    if not best.is_file():
+        raise FileNotFoundError(f"Ultralytics training finished without best.pt at {best}")
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(best, checkpoint)
+    print(f"[TRAIN] Checkpoint saved: {checkpoint}")
+    return checkpoint
 
-    result = results[0]
 
-    if (
-        result.probs is None
-        or result.probs.data is None
-    ):
-
-        raise RuntimeError(
-            "YOLO classification did "
-            "not return class probabilities."
+# ============================================================
+# 14. YOLO CLASSIFICATION LOADING AND INFERENCE
+# ============================================================
+def load_yolo(checkpoint_path, num_classes):
+    model = YOLO(str(checkpoint_path))
+    model.model.to(DEVICE).eval()
+    actual_classes = len(model.names)
+    if actual_classes != num_classes:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} has {actual_classes} classes, "
+            f"but dataset requires {num_classes}. Remove or replace incompatible checkpoint."
         )
+    parameters = sum(p.numel() for p in model.model.parameters())
+    return model, int(parameters)
 
-    probs = (
-        result.probs.data
-        .detach()
-        .float()
-    )
 
-    # Convert probabilities back to log-space
-    # so the same confidence/margin/entropy
-    # helper can be applied consistently.
-    logits = torch.log(
-        probs + 1e-12
-    ).unsqueeze(0)
-
-    prediction = int(
-        torch.argmax(
-            probs
-        ).item()
-    )
-
-    return (
-        prediction,
-        logits,
-    )
+def run_yolo_inference(model, image):
+    # The PIL image is resized and normalized inside the Ultralytics predictor.
+    # Force RGB for MNIST, FashionMNIST and KMNIST, while keeping RGB datasets RGB.
+    image = image.convert("RGB")
+    result = model.predict(
+        source=image,
+        imgsz=TRAIN_IMGSZ,
+        device=0 if DEVICE.type == "cuda" else "cpu",
+        verbose=False,
+    )[0]
+    if result.probs is None or result.probs.data is None:
+        raise RuntimeError("YOLO classification did not return probabilities")
+    probs = result.probs.data.detach().float()
+    # Log probabilities are suitable for the existing shared confidence/margin/entropy helper.
+    logits = torch.log(probs.clamp_min(1e-12)).unsqueeze(0)
+    prediction = int(probs.argmax().item())
+    return prediction, logits
 
 
 # ============================================================
@@ -1933,6 +1861,7 @@ def run_yolo_inference(
 def finalize_and_save(
     rows,
     output_path,
+    num_classes,
 ):
 
     if not rows:
@@ -1980,7 +1909,7 @@ def finalize_and_save(
             y_true,
             y_pred,
             labels=list(
-                range(10)
+                range(num_classes)
             ),
             average=
                 "weighted",
@@ -1994,7 +1923,7 @@ def finalize_and_save(
             y_true,
             y_pred,
             labels=list(
-                range(10)
+                range(num_classes)
             ),
             average=
                 "weighted",
@@ -2008,7 +1937,7 @@ def finalize_and_save(
             y_true,
             y_pred,
             labels=list(
-                range(10)
+                range(num_classes)
             ),
             average=
                 "weighted",
@@ -2103,6 +2032,8 @@ def test_model(
     model,
     parameters,
     inference_fn,
+    num_classes,
+    input_tokens,
 ):
 
     limit = min(
@@ -2141,7 +2072,19 @@ def test_model(
         checkpoint_path,
     )
 
+    output_path = DEVICE_LOG_DIR / f"{model_name.lower()}_{dataset_key}_test_telemetry.csv"
     rows = []
+    completed = set()
+    if output_path.is_file():
+        old = pd.read_csv(output_path)
+        if "sample_index" in old.columns and "model_type" in old.columns:
+            old = old[old["model_type"].astype(str) == model_name]
+            old = old.drop_duplicates(subset=["sample_index"], keep="first")
+            rows = old.to_dict("records")
+            completed = set(old["sample_index"].dropna().astype(int))
+    if all(i in completed for i in range(limit)):
+        print(f"[SKIP] {model_name}/{dataset_name} already has all {limit} samples: {output_path}")
+        return finalize_and_save(rows, output_path, num_classes)
 
     for sample_index in tqdm(
         range(limit),
@@ -2151,6 +2094,9 @@ def test_model(
         ),
         unit="sample",
     ):
+
+        if sample_index in completed:
+            continue
 
         image, true_label = (
             dataset[
@@ -2239,6 +2185,7 @@ def test_model(
 
             checkpoint_path=
                 checkpoint_path,
+            input_tokens=input_tokens,
         )
 
         rows.append(
@@ -2257,123 +2204,45 @@ def test_model(
     return finalize_and_save(
         rows,
         output_path,
+        num_classes,
     )
 
 
 # ============================================================
 # 17. MAIN
 # ============================================================
-
 def main():
-
-    print(
-        "=" * 72
-    )
-
-    print(
-        "YOLO "
-        "EXACT TELEMETRY TEST"
-    )
-
-    print(
-        "=" * 72
-    )
-
-    print(
-        "Device:",
-        DEVICE,
-    )
-
-    print(
-        "Reference column count:",
-        len(
-            REFERENCE_COLUMNS
-        ),
-    )
-
-    all_summaries = []
-
-    for (
-        dataset_name,
-        config,
-    ) in DATASET_CONFIGS.items():
-
-        dataset = (
-            load_raw_test_dataset(
-                config[
-                    "dataset_class"
-                ]
-            )
+    print(f"YOLO26n classification | device={DEVICE} | columns={len(REFERENCE_COLUMNS)}")
+    print(f"Selected datasets: {DATASETS}")
+    summaries = []
+    for dataset_name in DATASETS:
+        cfg = DATASET_CONFIGS[dataset_name]
+        print(f"\n{'='*72}\nDATASET {dataset_name}\n{'='*72}")
+        dataset = load_raw_test_dataset(dataset_name)
+        checkpoint = ensure_yolo_checkpoint(dataset_name)
+        model, parameters = load_yolo(checkpoint, cfg["num_classes"])
+        metrics = test_model(
+            dataset_name=dataset_name,
+            dataset_key=cfg["key"],
+            dataset=dataset,
+            model_name="YOLO26n-CLS",
+            checkpoint_path=checkpoint,
+            model=model,
+            parameters=parameters,
+            inference_fn=run_yolo_inference,
+            num_classes=cfg["num_classes"],
+            input_tokens=3 * cfg["image_size"] ** 2,
         )
+        summaries.append({"dataset": dataset_name, "model": "YOLO26n-CLS", **metrics})
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # ====================================================
-        # YOLO
-        # ====================================================
-
-        yolo_model, yolo_parameters = (
-            load_yolo(
-                config[
-                    "yolo_checkpoint"
-                ]
-            )
-        )
-
-        yolo_metrics = test_model(
-            dataset_name=
-                dataset_name,
-
-            dataset_key=
-                config["key"],
-
-            dataset=
-                dataset,
-
-            model_name=
-                "YOLO26n-CLS",
-
-            checkpoint_path=
-                config[
-                    "yolo_checkpoint"
-                ],
-
-            model=
-                yolo_model,
-
-            parameters=
-                yolo_parameters,
-
-            inference_fn=
-                run_yolo_inference,
-        )
-
-        all_summaries.append({
-            "model":
-                "YOLO26n-CLS",
-
-            "dataset":
-                dataset_name,
-
-            **yolo_metrics,
-        })
-
-        del yolo_model
-
-
-    # pd.DataFrame(
-    #     all_summaries
-    # ).to_csv(
-    #     summary_path,
-    #     index=False,
-    # )
-
-    print(
-        "\n"
-        + "=" * 72
-    )
-
-    print(
-        "ALL YOLO TESTS COMPLETE"
-    )
+    if summaries:
+        summary_path = DEVICE_LOG_DIR / "yolo26n_classification_summary.csv"
+        pd.DataFrame(summaries).to_csv(summary_path, index=False)
+        print(f"Summary saved: {summary_path}")
+    print("\nAll selected YOLO classification tests complete")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ import classical_cnn_dnn as classical
 import classical_yolo as classical_yolo
 import quantum_dnn_cnn as quantum
 import quantum_yolo as quantum_yolo
-os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+
 try:
     from codecarbon import EmissionsTracker
 except ImportError:
@@ -376,7 +376,7 @@ if all_rows:
 
     for dataset_name, dataset_df in df.groupby("dataset"):
         dataset_df.to_csv(
-            OUTPUT_ROOT / f"{dataset_name.lower()}_unified_energy_telemetry.csv",
+            OUTPUT_ROOT / f"{dataset_name.lower()}_energy_telemetry.csv",
             index=False
         )
 
@@ -385,7 +385,7 @@ if summaries:
 
     for dataset_name, dataset_df in df.groupby("dataset"):
         dataset_df.to_csv(
-            OUTPUT_ROOT / f"{dataset_name.lower()}_unified_energy_telemetry_summary.csv",
+            OUTPUT_ROOT / f"{dataset_name.lower()}_energy_summary.csv",
             index=False
         )
 

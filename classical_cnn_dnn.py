@@ -5,6 +5,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ import psutil
 import torch
 import torch.nn.functional as F
 from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -32,11 +34,11 @@ NUM_TEST_SAMPLES = int(os.getenv("NUM_TEST_SAMPLES", 10))
 # ============================================================
 
 class SimpleDNN(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=1, image_size=28, num_classes=10):
         super().__init__()
 
         # Layer 1
-        self.fc1 = nn.Linear(28 * 28, 512)
+        self.fc1 = nn.Linear(in_channels * image_size * image_size, 512)
 
         # Layer 2
         self.fc2 = nn.Linear(512, 256)
@@ -45,7 +47,7 @@ class SimpleDNN(nn.Module):
         self.fc3 = nn.Linear(256, 128)
 
         # Layer 4
-        self.fc4 = nn.Linear(128, 10)
+        self.fc4 = nn.Linear(128, num_classes)
 
     def forward(self, x):
         x = torch.flatten(x, 1)
@@ -61,12 +63,12 @@ class SimpleDNN(nn.Module):
 # ============================================================
 
 class SimpleCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
 
         # Layer 1
         self.conv1 = nn.Conv2d(
-            in_channels=1,
+            in_channels=in_channels,
             out_channels=32,
             kernel_size=3
         )
@@ -77,6 +79,8 @@ class SimpleCNN(nn.Module):
             out_channels=64,
             kernel_size=3
         )
+
+        self.adapt_pool = nn.AdaptiveAvgPool2d((5, 5))
 
         self.pool = nn.MaxPool2d(
             kernel_size=2,
@@ -92,7 +96,7 @@ class SimpleCNN(nn.Module):
         # Layer 4
         self.fc2 = nn.Linear(
             128,
-            10
+            num_classes
         )
 
     def forward(self, x):
@@ -109,6 +113,7 @@ class SimpleCNN(nn.Module):
             )
         )
 
+        x = self.adapt_pool(x)
         x = torch.flatten(x, 1)
 
         x = F.relu(
@@ -167,37 +172,99 @@ OUTPUT_ROOT.mkdir(exist_ok=True)
 DEVICE_LOG_DIR = OUTPUT_ROOT / f"{DEVICE_SHORT}"
 DEVICE_LOG_DIR.mkdir(exist_ok=True)
 
-DATA_ROOT = Path("./classical_data")
+DATA_ROOT = Path("./data")
 
 # VERBOSE_DATASET_PATH = Path(
 #     "mnist_fgsm_test_dataset.pt"
 # )
 
 # ============================================================
-# Dataset configuration: MNIST, FashionMNIST, Kuzushiji-MNIST
+# Dataset configuration and Tiny ImageNet validation loader
 # ============================================================
-# Each dataset uses its own torchvision class, its own per-channel
-# normalization stats, and its own saved model checkpoint prefix
-# (produced by the training script as "<name>_cnn.pth" / "<name>_dnn.pth").
+# For RGB datasets, checkpoints MUST be trained with the matching
+# input shape, class count, and model definitions below.
+# Tiny ImageNet is not downloaded automatically by torchvision.
+# Expected: classical_data/tiny-imagenet-200/val/images and
+#           classical_data/tiny-imagenet-200/val/val_annotations.txt
+
+DATA_ROOT = Path(os.getenv("DATA_ROOT", "./data"))
+CHECKPOINT_ROOT = Path(os.getenv("CHECKPOINT_ROOT", "."))
+
+class TinyImageNetValidation(torch.utils.data.Dataset):
+    def __init__(self, root, transform=None):
+        self.root = Path(root)
+        self.transform = transform
+        wnids_path = self.root / "wnids.txt"
+        if not wnids_path.is_file():
+            raise FileNotFoundError(f"Missing Tiny ImageNet class list: {wnids_path}")
+        wnids = sorted(line.strip() for line in wnids_path.read_text().splitlines() if line.strip())
+        if len(wnids) != 200:
+            raise ValueError(f"Expected 200 Tiny ImageNet class IDs, found {len(wnids)}")
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(wnids)}
+        val_dir = self.root / "val"
+        annotation_path = val_dir / "val_annotations.txt"
+        self.samples = []
+        if annotation_path.is_file():
+            for line in annotation_path.read_text().splitlines():
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                name, class_id = parts[:2]
+                path = val_dir / "images" / name
+                if class_id in self.class_to_idx and path.is_file():
+                    self.samples.append((path, self.class_to_idx[class_id]))
+        else:
+            # Also accept validation data already organized by class.
+            for class_id, idx in self.class_to_idx.items():
+                for path in sorted((val_dir / class_id).rglob("*")):
+                    if path.suffix.lower() in {".jpeg", ".jpg", ".png"}:
+                        self.samples.append((path, idx))
+        if not self.samples:
+            raise FileNotFoundError(f"No labeled validation images found in {val_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        with Image.open(path) as img:
+            image = img.convert("RGB")
+            if self.transform is not None:
+                image = self.transform(image)
+        return image, label
 
 DATASET_CONFIGS = {
     "MNIST": {
         "dataset_class": datasets.MNIST,
-        "mean": (0.1307,),
-        "std": (0.3081,),
-        "checkpoint_prefix": "mnist",
+        "mean": (0.1307,), "std": (0.3081,),
+        "checkpoint_prefix": "mnist", "channels": 1,
+        "image_size": 28, "num_classes": 10,
     },
     "FashionMNIST": {
         "dataset_class": datasets.FashionMNIST,
-        "mean": (0.2860,),
-        "std": (0.3530,),
-        "checkpoint_prefix": "fashionmnist",
+        "mean": (0.2860,), "std": (0.3530,),
+        "checkpoint_prefix": "fashionmnist", "channels": 1,
+        "image_size": 28, "num_classes": 10,
     },
     "KMNIST": {
-        "dataset_class": datasets.KMNIST,  # Kuzushiji-MNIST
-        "mean": (0.1918,),
-        "std": (0.3483,),
-        "checkpoint_prefix": "kmnist",
+        "dataset_class": datasets.KMNIST,
+        "mean": (0.1918,), "std": (0.3483,),
+        "checkpoint_prefix": "kmnist", "channels": 1,
+        "image_size": 28, "num_classes": 10,
+    },
+    "CIFAR100": {
+        "dataset_class": datasets.CIFAR100,
+        "mean": (0.5071, 0.4867, 0.4408),
+        "std": (0.2675, 0.2565, 0.2761),
+        "checkpoint_prefix": "cifar100", "channels": 3,
+        "image_size": 32, "num_classes": 100,
+    },
+    "TinyImageNet200": {
+        "dataset_class": None,
+        "mean": (0.4802, 0.4481, 0.3975),
+        "std": (0.2302, 0.2265, 0.2262),
+        "checkpoint_prefix": "tinyimagenet200", "channels": 3,
+        "image_size": 64, "num_classes": 200,
     },
 }
 
@@ -205,7 +272,8 @@ DATASET_CONFIGS = {
 
 
 
-torch.set_grad_enabled(False)
+# Gradients must remain enabled for checkpoint training.
+# Inference is already protected by torch.inference_mode() in _run_torch_model.
 
 
 
@@ -990,6 +1058,115 @@ def backfill_model_metrics(file_path, model_name):
 
 
 # ============================================================
+# Train missing model checkpoints (training data only)
+# ============================================================
+
+TRAIN_EPOCHS = int(os.getenv("TRAIN_EPOCHS", "10"))
+TRAIN_BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "128"))
+TRAIN_LR = float(os.getenv("TRAIN_LR", "0.001"))
+TRAIN_WORKERS = int(os.getenv("TRAIN_WORKERS", "0"))
+TRAIN_MAX_SAMPLES = int(os.getenv("TRAIN_MAX_SAMPLES", "0"))  # 0 = all training images
+TRAIN_DEVICE_MODE = os.getenv("TRAIN_DEVICE", "auto").lower()
+
+
+def resolve_training_device():
+    if TRAIN_DEVICE_MODE == "cpu":
+        return torch.device("cpu")
+    if TRAIN_DEVICE_MODE == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("TRAIN_DEVICE=cuda requested, but CUDA is unavailable")
+        return torch.device("cuda")
+    if TRAIN_DEVICE_MODE != "auto":
+        raise ValueError("TRAIN_DEVICE must be auto, cpu, or cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def build_training_dataset(dataset_name):
+    cfg = DATASET_CONFIGS[dataset_name]
+    transform = transforms.Compose([
+        transforms.Resize((cfg["image_size"], cfg["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize(cfg["mean"], cfg["std"]),
+    ])
+    if dataset_name == "TinyImageNet200":
+        tiny_root = Path(os.getenv(
+            "TINY_IMAGENET_ROOT", str(DATA_ROOT / "tiny-imagenet-200")
+        ))
+        if not (tiny_root / "wnids.txt").is_file():
+            raise FileNotFoundError(f"Missing {tiny_root / 'wnids.txt'}")
+        train_dir = tiny_root / "train"
+        if not train_dir.is_dir():
+            raise FileNotFoundError(f"Tiny ImageNet training directory is missing: {train_dir}")
+        dataset = datasets.ImageFolder(str(train_dir), transform=transform)
+        expected_classes = sorted(x.strip() for x in
+                                  (tiny_root / "wnids.txt").read_text().splitlines() if x.strip())
+        if len(expected_classes) != 200 or dataset.classes != expected_classes:
+            raise ValueError("Tiny ImageNet training classes do not match wnids.txt; "
+                             "training and validation label indices would disagree")
+    else:
+        dataset = cfg["dataset_class"](
+            root=str(DATA_ROOT), train=True, download=True, transform=transform
+        )
+
+    if TRAIN_MAX_SAMPLES > 0 and TRAIN_MAX_SAMPLES < len(dataset):
+        # Reproducible subset for quick experiments; default remains full training set.
+        generator = torch.Generator().manual_seed(42)
+        selection = torch.randperm(len(dataset), generator=generator)[:TRAIN_MAX_SAMPLES].tolist()
+        dataset = Subset(dataset, selection)
+    return dataset
+
+
+def train_missing_checkpoint(model, dataset_name, model_name, checkpoint_path):
+    if TRAIN_EPOCHS < 1 or TRAIN_BATCH_SIZE < 1:
+        raise ValueError("TRAIN_EPOCHS and TRAIN_BATCH_SIZE must be positive")
+    train_set = build_training_dataset(dataset_name)
+    train_device = resolve_training_device()
+    print(f"[TRAIN] Missing {checkpoint_path.name}. Training {dataset_name} / {model_name} "
+          f"on {train_device} ({len(train_set)} training images, {TRAIN_EPOCHS} epochs)")
+    generator = torch.Generator().manual_seed(42)
+    loader = DataLoader(
+        train_set, batch_size=TRAIN_BATCH_SIZE, shuffle=True,
+        num_workers=TRAIN_WORKERS, generator=generator,
+        pin_memory=(train_device.type == "cuda")
+    )
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    model.to(train_device)
+    model.train()
+    optimizer = optim.Adam(model.parameters(), lr=TRAIN_LR)
+    loss_fn = nn.CrossEntropyLoss()
+    try:
+        with torch.enable_grad():
+            for epoch in range(1, TRAIN_EPOCHS + 1):
+                running_loss, correct, count = 0.0, 0, 0
+                batches = tqdm(loader, desc=f"Train {dataset_name} {model_name} "
+                               f"{epoch}/{TRAIN_EPOCHS}", leave=False)
+                for inputs, labels in batches:
+                    inputs = inputs.to(train_device, non_blocking=True)
+                    labels = labels.to(train_device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = model(inputs)
+                    loss = loss_fn(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+                    n = labels.size(0)
+                    running_loss += loss.item() * n
+                    correct += (logits.argmax(dim=1) == labels).sum().item()
+                    count += n
+                print(f"[TRAIN] {dataset_name}/{model_name} epoch {epoch}/{TRAIN_EPOCHS}: "
+                      f"loss={running_loss/count:.4f} train_acc={correct/count:.2%}")
+        # Save only when training finished successfully; avoid partial checkpoints.
+        tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+        torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
+        print(f"[SAVED] {checkpoint_path.resolve()}")
+    finally:
+        model.to(DEVICE)
+        model.eval()
+        if train_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+# ============================================================
 # Main collection loop
 # ============================================================
 
@@ -1002,24 +1179,35 @@ def collect_for_model(base_dataset, model_name, dataset_name="MNIST", mean=(0.13
 
     rows = []
 
-    checkpoint_prefix = DATASET_CONFIGS[dataset_name]["checkpoint_prefix"]
+    cfg = DATASET_CONFIGS[dataset_name]
+    checkpoint_prefix = cfg["checkpoint_prefix"]
 
     if model_name == "CNN":
-        checkpoint_path = f"../{checkpoint_prefix}_cnn.pth"
-        model = SimpleCNN().to(DEVICE)
-        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
-        model.eval()
-        model_flops = compute_model_flops(model, DEVICE)
-
+        checkpoint_path = CHECKPOINT_ROOT / f"{checkpoint_prefix}_cnn.pth"
+        model = SimpleCNN(in_channels=cfg["channels"], num_classes=cfg["num_classes"])
     elif model_name == "DNN":
-        checkpoint_path = f"../{checkpoint_prefix}_dnn.pth"
-        model = SimpleDNN().to(DEVICE)
-        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
-        model.eval()
-        model_flops = compute_model_flops(model, DEVICE)
-
+        checkpoint_path = CHECKPOINT_ROOT / f"{checkpoint_prefix}_dnn.pth"
+        model = SimpleDNN(in_channels=cfg["channels"], image_size=cfg["image_size"],
+                          num_classes=cfg["num_classes"])
     else:
         raise ValueError(f"Unknown model: {model_name}")
+
+    # Do not retrain an existing checkpoint; use training data only if missing.
+    if checkpoint_path.is_file():
+        print(f"[LOAD] Existing checkpoint: {checkpoint_path.resolve()}")
+        try:
+            model.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+        except RuntimeError as exc:
+            raise RuntimeError(f"Checkpoint {checkpoint_path} is incompatible with the "
+                               f"current {model_name} architecture for {dataset_name}. "
+                               "Rename or remove it if retraining is intended.") from exc
+    else:
+        train_missing_checkpoint(model, dataset_name, model_name, checkpoint_path)
+
+    model = model.to(DEVICE).eval()
+    model_flops = compute_model_flops(
+        model, DEVICE, (1, cfg["channels"], cfg["image_size"], cfg["image_size"])
+    )
 
     # Compute parameter count directly from the loaded model.
     # No separate model-metrics file is needed.
@@ -1076,7 +1264,7 @@ def collect_for_model(base_dataset, model_name, dataset_name="MNIST", mean=(0.13
             carbon_intensity=carbon_intensity,
             gpu_metrics=gpu_snap,
             model_flops=model_flops,
-            quantum_computing = file_name != 'vanilla',
+            quantum_computing = False,  # Both models here are classical.
             dataset_name=dataset_name,
             sample_id=i,
             checkpoint_path=checkpoint_path,
@@ -1110,39 +1298,38 @@ def collect_for_model(base_dataset, model_name, dataset_name="MNIST", mean=(0.13
 
 
 def main():
+    # Set DATASETS=CIFAR100,TinyImageNet200 to run only the new datasets.
+    names = [name.strip() for name in os.getenv(
+        "DATASETS", "MNIST,FashionMNIST,KMNIST,CIFAR100,TinyImageNet200"
+    ).split(",") if name.strip()]
+    invalid = [name for name in names if name not in DATASET_CONFIGS]
+    if invalid:
+        raise ValueError(f"Unsupported datasets: {invalid}")
 
-    # Loop over all three datasets (MNIST, FashionMNIST, KMNIST) and both
-    # architectures (CNN, DNN). Each combination loads its own checkpoint
-    # (e.g. "fashionmnist_cnn.pth") and writes to its own CSV, so results
-    # never overwrite or mix across datasets.
-
-    for dataset_name, config in DATASET_CONFIGS.items():
-
-        print(f"\n{'=' * 60}")
-        print(f"Dataset: {dataset_name}")
-        print(f"{'=' * 60}")
-
-        # Raw ToTensor only here — normalization is applied per-sample
-        # inside _run_torch_model using this dataset's own mean/std.
-        base_dataset = config["dataset_class"](
-            root="../classical_data",
-            train=False,
-            download=True,
-            transform=transforms.ToTensor()
-        )
-
+    for dataset_name in names:
+        config = DATASET_CONFIGS[dataset_name]
+        print(f"\n{'=' * 60}\nDataset: {dataset_name}\n{'=' * 60}")
+        transform = transforms.Compose([
+            transforms.Resize((config["image_size"], config["image_size"])),
+            transforms.ToTensor(),
+        ])
+        if dataset_name == "TinyImageNet200":
+            tiny_root = Path(os.getenv(
+                "TINY_IMAGENET_ROOT", str(DATA_ROOT / "tiny-imagenet-200")
+            ))
+            base_dataset = TinyImageNetValidation(tiny_root, transform=transform)
+        else:
+            base_dataset = config["dataset_class"](
+                root=str(DATA_ROOT), train=False, download=True,
+                transform=transform,
+            )
         for model_name in ("CNN", "DNN"):
             collect_for_model(
-                base_dataset,
-                model_name,
-                dataset_name=dataset_name,
-                mean=config["mean"],
-                std=config["std"],
-                num_samples=NUM_TEST_SAMPLES,
-                flush_every=25,
-                file_name='vanilla'
+                base_dataset, model_name, dataset_name=dataset_name,
+                mean=config["mean"], std=config["std"],
+                num_samples=NUM_TEST_SAMPLES, flush_every=25,
+                file_name="vanilla",
             )
-
     print("\nDone.")
 
 
