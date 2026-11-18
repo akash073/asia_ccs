@@ -24,7 +24,7 @@ from ultralytics import YOLO
 
 SEED=int(os.getenv('RANDOM_SEED','42'))
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-DATA_ROOT=Path(os.getenv('DATA_ROOT','../classical_data'))
+DATA_ROOT=Path(os.getenv('DATA_ROOT','./data'))
 TINY_ROOT=Path(os.getenv('TINY_IMAGENET_ROOT',str(DATA_ROOT/'tiny-imagenet-200')))
 CHECKPOINT_DIR=Path(os.getenv('CHECKPOINT_DIR','./quantum_checkpoints'))
 CHECKPOINT_DIR.mkdir(parents=True,exist_ok=True)
