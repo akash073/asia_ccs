@@ -1,2 +1,7 @@
 ultralytics
 fvcore
+pynvml
+pandas
+scikit-learn
+pennyLane
+codecarbon
