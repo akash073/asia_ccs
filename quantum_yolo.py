@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pretrained YOLO26n-CLS: 5-qubit PennyLane vs two matched classical controls.
+"""Pretrained YOLO26n-CLS: 10-qubit PennyLane vs two matched classical controls.
 
 Features:
 - Models: quantum, classical_bottleneck, classical_standard.
@@ -12,10 +12,10 @@ Features:
 - Metrics, per-sample predictions, and confusion matrices; NO energy telemetry.
 
 Examples:
-  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100
-  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100 TinyImageNet200 --models quantum classical_bottleneck classical_standard
-  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100 --train-samples 1000 --test-samples 100 --head-epochs 1 --finetune-epochs 1
-  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100 --eval-only
+  python train_improved_hybrid_yolo26n_10q.py --datasets CIFAR100
+  python train_improved_hybrid_yolo26n_10q.py --datasets CIFAR100 TinyImageNet200 --models quantum classical_bottleneck classical_standard
+  python train_improved_hybrid_yolo26n_10q.py --datasets CIFAR100 --train-samples 1000 --test-samples 100 --head-epochs 1 --finetune-epochs 1
+  python train_improved_hybrid_yolo26n_10q.py --datasets CIFAR100 --eval-only
 
 The quantum circuit uses classical CPU simulation; no quantum processor is used.
 Do not compare telemetry collected here against earlier randomly initialized architectures
@@ -252,7 +252,8 @@ def dataset_base(name, is_train, args):
     if name == "TinyImageNet200":
         return TinyImageNet(args.tiny_root, "train" if is_train else "val", transform=None)
     ds_cls = {"MNIST": datasets.MNIST, "FashionMNIST": datasets.FashionMNIST,
-              "KMNIST": datasets.KMNIST, "CIFAR100": datasets.CIFAR100}[name]
+              "KMNIST": datasets.KMNIST, "CIFAR10": datasets.CIFAR10,
+              "CIFAR100": datasets.CIFAR100}[name]
     return ds_cls(root=str(args.data_root), train=is_train, download=True, transform=None)
 
 
@@ -625,7 +626,7 @@ def main():
     print("Pretrained Hybrid YOLO26n-CLS / PennyLane statevector simulation")
     print(f"Device={device}; models={args.models}; datasets={args.datasets}")
     print(f"Stages: frozen-head {args.head_epochs} epochs + fine-tune {args.finetune_epochs} epochs")
-    print("Architecture: 5-qubit variational circuit (default), 4 layers with data re-uploading")
+    print(f"Architecture: {args.qubits}-qubit variational circuit, {args.quantum_layers} layers with data re-uploading")
     print("Note: simulated quantum model on CPU; it may be very slow on full CIFAR-100/Tiny ImageNet")
     results = []
     errors = []
