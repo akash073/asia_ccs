@@ -10,6 +10,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from collections import Counter
 from PIL import Image
 from typing import Iterable
 
@@ -26,6 +27,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
+    balanced_accuracy_score,
 )
 
 from torch.utils.data import DataLoader
@@ -171,37 +173,95 @@ DATASET_CONFIGS = {
 # A new checkpoint filename prevents loading weights learned with the original
 # degenerate 1-qubit min/max preprocessing.
 PREPROCESSING_VERSION = 3
+# Checking the data alone never trains a model or touches a checkpoint.
+AUDIT_ONLY = os.getenv("AUDIT_ONLY", "0").strip() == "1"
+# Default: prevent training just because a checkpoint is missing.
+EVAL_ONLY = os.getenv("EVAL_ONLY", "1").strip() == "1"
+SUMMARY_PATH = DEVICE_LOG_DIR / "quantum_classification_metrics_summary.csv"
 
 class TinyImageNetValidation(torch.utils.data.Dataset):
-    """Original Tiny ImageNet 200 validation layout (with annotations)."""
+    """Strict Tiny ImageNet validation loader; fail on incomplete datasets."""
+
     def __init__(self, root, transform=None, class_to_idx=None):
+        from collections import Counter
+
         root = Path(root)
         self.transform = transform
         wnids_file = root / "wnids.txt"
         if not wnids_file.is_file():
             raise FileNotFoundError(f"Missing Tiny ImageNet wnids.txt: {wnids_file}")
-        ids = sorted(x.strip() for x in wnids_file.read_text().splitlines() if x.strip())
-        if len(ids) != 200:
-            raise ValueError(f"Expected 200 Tiny ImageNet classes, found {len(ids)}")
-        self.class_to_idx = class_to_idx or {x: i for i, x in enumerate(ids)}
-        ann = root / "val" / "val_annotations.txt"
+        wnids = sorted(x.strip() for x in wnids_file.read_text().splitlines() if x.strip())
+        if len(wnids) != 200 or len(set(wnids)) != 200:
+            raise ValueError(f"Expected 200 unique class identifiers, got {len(wnids)}")
+        expected_map = {name: idx for idx, name in enumerate(wnids)}
+        if class_to_idx is not None and class_to_idx != expected_map:
+            raise ValueError("Train/validation class mappings differ; cannot safely evaluate")
+        self.class_to_idx = expected_map
         self.samples = []
+        ann = root / "val" / "val_annotations.txt"
+        seen_names = set()
+        missing_paths = []
+        unknown_labels = []
         if ann.is_file():
-            for line in ann.read_text().splitlines():
+            lines = [line for line in ann.read_text().splitlines() if line.strip()]
+            for line_no, line in enumerate(lines, 1):
                 parts = line.split()
-                if len(parts) >= 2:
-                    file_name, label = parts[:2]
-                    image_path = root / "val" / "images" / file_name
-                    if label in self.class_to_idx and image_path.is_file():
-                        self.samples.append((image_path, self.class_to_idx[label]))
+                if len(parts) < 2:
+                    raise ValueError(f"Malformed validation annotation line {line_no}: {line!r}")
+                file_name, label = parts[:2]
+                if file_name in seen_names:
+                    raise ValueError(f"Duplicate validation image in annotations: {file_name}")
+                seen_names.add(file_name)
+                if label not in self.class_to_idx:
+                    unknown_labels.append((file_name, label))
+                    continue
+                path = root / "val" / "images" / file_name
+                if not path.is_file():
+                    missing_paths.append(str(path))
+                    continue
+                self.samples.append((path, self.class_to_idx[label]))
+            print(f"Tiny ImageNet audit: annotation rows={len(lines):,}; "
+                  f"found={len(self.samples):,}; missing images={len(missing_paths):,}; "
+                  f"unknown classes={len(unknown_labels):,}")
+            if len(lines) != 10000 or missing_paths or unknown_labels:
+                report = OUTPUT_ROOT / "tinyimagenet_validation_audit.csv"
+                pd.DataFrame(
+                    [{"issue": "missing_image", "path_or_label": path} for path in missing_paths]
+                    + [{"issue": "unknown_label", "path_or_label": f"{fn}: {label}"}
+                       for fn, label in unknown_labels]
+                    + ([{"issue": "annotation_count", "path_or_label": str(len(lines))}]
+                       if len(lines) != 10000 else [])
+                ).to_csv(report, index=False)
+                raise RuntimeError(
+                    f"Incomplete Tiny ImageNet validation set at {root}. "
+                    f"Expected 10,000 annotations; found {len(lines)}. "
+                    f"Missing image files: {len(missing_paths)}; "
+                    f"unknown labels: {len(unknown_labels)}. "
+                    f"Example missing files: {missing_paths[:5]}. "
+                    f"Full audit: {report}. Restore the missing data before evaluating."
+                )
         else:
             for label, idx in self.class_to_idx.items():
-                for path in sorted((root / "val" / label).rglob("*")):
-                    if path.suffix.lower() in (".jpeg", ".jpg", ".png"):
+                folder = root / "val" / label
+                if not folder.is_dir():
+                    raise FileNotFoundError(f"Missing validation class folder: {folder}")
+                for path in sorted(folder.rglob("*")):
+                    if path.is_file() and path.suffix.lower() in (".jpeg", ".jpg", ".png"):
                         self.samples.append((path, idx))
-        if not self.samples:
-            raise FileNotFoundError(f"No labeled validation images found in {root / 'val'}")
-        self.samples.sort(key=lambda v: str(v[0]))
+            print(f"Tiny ImageNet audit: class-folder layout; found {len(self.samples):,} images")
+
+        counts = Counter(label for _, label in self.samples)
+        bad_classes = {wnids[i]: counts.get(i, 0) for i in range(200)
+                       if counts.get(i, 0) != 50}
+        if len(self.samples) != 10000 or bad_classes:
+            raise RuntimeError(
+                f"Tiny ImageNet validation is incomplete or unbalanced: "
+                f"{len(self.samples)}/10000 images; "
+                f"{len(bad_classes)} classes do not have exactly 50 images. "
+                f"Examples: {list(bad_classes.items())[:10]}"
+            )
+        self.samples.sort(key=lambda item: str(item[0]))
+        print("Tiny ImageNet validation verified: 10,000 images, 200 classes, 50 per class")
 
     def __len__(self):
         return len(self.samples)
@@ -211,7 +271,6 @@ class TinyImageNetValidation(torch.utils.data.Dataset):
         with Image.open(path) as im:
             image = im.convert("RGB")
             return (self.transform(image) if self.transform else image), label
-
 
 def load_dataset_pair(dataset_name, config):
     """Train split for fitting; unseen official test/val split for telemetry."""
@@ -244,7 +303,7 @@ def load_dataset_pair(dataset_name, config):
 
 QUANTUM_MODELS = (
     "QuantumCNN4",
-    #"QuantumDNN4",
+    "QuantumDNN4",
 )
 
 
@@ -1666,6 +1725,7 @@ def save_checkpoint(
             int(
                 epoch
             ),
+        "completed": bool(epoch == TRAIN_EPOCHS),
 
         "best_val_loss":
             float(
@@ -2022,7 +2082,8 @@ def train_model(
                   f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_checkpoint(model, checkpoint_path, dataset_name, epoch, best_val_loss)
+            # Keep the latest epoch: checkpoint epoch always reflects training progress.
+            save_checkpoint(model, checkpoint_path, dataset_name, epoch, best_val_loss)
         else:
             # Full-data training: there is no independent validation loss.
             print(f"Epoch {epoch}: train_loss={running_loss/max(1,total_count):.4f}, "
@@ -2063,6 +2124,25 @@ def get_or_train_model(
         and not FORCE_RETRAIN
     ):
 
+        saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        saved_epoch = int(saved.get("epoch", 0))
+        completed_flag = saved.get("completed")
+        # Original checkpoints did not store 'completed'. The final epoch is
+        # the strongest available evidence for those legacy artifacts.
+        if saved_epoch < TRAIN_EPOCHS or completed_flag is False:
+            raise RuntimeError(
+                f"Checkpoint is incomplete: {checkpoint_path} "
+                f"(epoch={saved_epoch}, completed={completed_flag}). "
+                "Preserved unchanged. Resume training with optimizer state "
+                "or explicitly retrain if you intend to replace it."
+            )
+        if completed_flag is None:
+            warnings.warn(
+                f"Legacy checkpoint has no completion marker; accepting "
+                f"epoch={saved_epoch}, but independently verify its training log: {checkpoint_path}"
+            )
+        if str(saved.get("dataset_name")) != dataset_name or int(saved.get("n_qubits", -1)) != n_qubits:
+            raise RuntimeError(f"Dataset/qubit mismatch in checkpoint: {checkpoint_path}")
         model = (
             load_checkpoint(
                 checkpoint_path
@@ -2076,6 +2156,12 @@ def get_or_train_model(
                 "Set FORCE_RETRAIN=1 to replace it."
             )
         return model, checkpoint_path
+
+    if EVAL_ONLY:
+        raise FileNotFoundError(
+            f"No checkpoint at {checkpoint_path}. EVAL_ONLY=1 prevents accidental retraining. "
+            "Set EVAL_ONLY=0 only when you want to train a new model."
+        )
 
     model = (
         Quantum4LayerClassifier(
@@ -2848,6 +2934,8 @@ def read_existing_results(file_path):
         raise ValueError(f"Existing CSV {file_path} missing columns: {sorted(missing)}")
     if df['sample_index'].isna().any():
         raise ValueError(f"Existing CSV {file_path} has null sample_index")
+    if df.duplicated(subset=["model_type", "sample_index"]).any():
+        raise RuntimeError(f"Duplicate sample indices in {file_path}")
     return df.reindex(columns=REFERENCE_COLUMNS)
 
 
@@ -2887,11 +2975,7 @@ def backfill_model_metrics(
     if not file_path.exists():
         return None
 
-    df = pd.read_csv(
-        file_path,
-        on_bad_lines=
-            "skip",
-    )
+    df = pd.read_csv(file_path)  # Fail on malformed CSVs; do not hide missing samples.
 
     if (
         "model_type"
@@ -3049,12 +3133,35 @@ def collect_for_model(base_dataset, model, checkpoint_path, model_name,
     """
     limit = len(base_dataset) if num_samples == 0 else min(num_samples, len(base_dataset))
     output_path = get_output_path(model_name, dataset_name, model.n_qubits, checkpoint_path)
+    existing = read_existing_results(output_path)
+    if not existing.empty:
+        if dataset_name == "TinyImageNet200" and len(existing) != limit:
+            raise RuntimeError(
+                f"Found {len(existing)} previous Tiny ImageNet telemetry rows but "
+                f"the verified evaluation split has {limit}. Existing sample indices "
+                "might refer to the old incomplete dataset and cannot safely be "
+                f"resumed. Move/rename this CSV before starting a fresh evaluation: {output_path}"
+            )
+        for rec in existing.itertuples(index=False):
+            idx = int(rec.sample_index)
+            if idx >= limit or idx < 0:
+                raise RuntimeError(f"Saved sample index {idx} is out of range in {output_path}")
+            if dataset_name == "TinyImageNet200":
+                expected_label = int(base_dataset.samples[idx][1])
+                if int(rec.true_label) != expected_label:
+                    raise RuntimeError(
+                        f"Saved sample {idx} label does not match current validation "
+                        f"dataset ({rec.true_label} vs {expected_label}); "
+                        f"rename old CSV and re-evaluate: {output_path}"
+                    )
     completed = get_completed_indices(output_path, model_name)
     pending = [i for i in range(limit) if i not in completed]
     print(f"{dataset_name}/{model_name}: {len(completed & set(range(limit)))}/{limit} done; "
           f"{len(pending)} remaining; output={output_path}")
     if not pending:
         backfill_model_metrics(output_path, model_name)
+        save_metrics_summary(output_path, dataset_name, model_name, model.n_qubits,
+                             checkpoint_path, limit, model.n_classes)
         return
     model.eval()
     for group_start in tqdm(range(0, len(pending), flush_every), desc=f"{dataset_name}/{model_name}"):
@@ -3088,7 +3195,62 @@ def collect_for_model(base_dataset, model, checkpoint_path, model_name,
         ) for idx, label, pred, logits, elapsed in results]
         append_rows(rows, output_path)
     backfill_model_metrics(output_path, model_name)
+    save_metrics_summary(output_path, dataset_name, model_name, model.n_qubits,
+                         checkpoint_path, limit, model.n_classes)
     print(f"Saved {limit} predictions: {output_path}")
+
+def save_metrics_summary(csv_path, dataset_name, model_name, n_qubits,
+                         checkpoint_path, expected_count, n_classes):
+    """Summarize ONLY complete, unique held-out predictions."""
+    df = read_existing_results(csv_path)
+    if len(df) != expected_count:
+        raise RuntimeError(f"Incomplete predictions: {len(df)}/{expected_count} at {csv_path}")
+    indices = sorted(df["sample_index"].astype(int).tolist())
+    if indices != list(range(expected_count)):
+        raise RuntimeError("Test sample indices are not exactly 0..N-1")
+    if df[["true_label", "prediction"]].isna().any().any():
+        raise RuntimeError(f"Missing labels/predictions in {csv_path}")
+    y_true = df["true_label"].astype(int).to_numpy()
+    y_pred = df["prediction"].astype(int).to_numpy()
+    if np.any(y_true < 0) or np.any(y_true >= n_classes) or np.any(y_pred < 0) or np.any(y_pred >= n_classes):
+        raise RuntimeError("Out-of-range labels/predictions")
+    classes_present = len(np.unique(y_true))
+    if dataset_name == "TinyImageNet200" and expected_count == 10000:
+        if classes_present != 200 or not np.all(np.bincount(y_true, minlength=200) == 50):
+            raise RuntimeError("Invalid Tiny ImageNet validation class distribution")
+    result = {
+        "dataset": dataset_name, "model_type": model_name,
+        "n_qubits": n_qubits, "test_samples": expected_count,
+        "classes_present": classes_present, "num_classes": n_classes,
+        "correct_predictions": int(np.sum(y_true == y_pred)),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "precision_weighted": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall_weighted": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+        "precision_macro": precision_score(y_true, y_pred, labels=list(range(n_classes)), average="macro", zero_division=0),
+        "recall_macro": recall_score(y_true, y_pred, labels=list(range(n_classes)), average="macro", zero_division=0),
+        "f1_macro": f1_score(y_true, y_pred, labels=list(range(n_classes)), average="macro", zero_division=0),
+        "checkpoint_path": str(checkpoint_path), "telemetry_csv": str(csv_path),
+    }
+    if SUMMARY_PATH.exists():
+        all_results = pd.read_csv(SUMMARY_PATH)
+        all_results = all_results.loc[~((all_results["checkpoint_path"] == str(checkpoint_path)) &
+                                        (all_results["test_samples"] == expected_count))]
+    else:
+        all_results = pd.DataFrame()
+    all_results = pd.concat([all_results, pd.DataFrame([result])], ignore_index=True)
+    order = {x: i for i, x in enumerate(["TinyImageNet200", "CIFAR100", "KMNIST", "FashionMNIST", "MNIST"])}
+    all_results["_order"] = all_results["dataset"].map(order)
+    all_results = all_results.sort_values(["_order", "model_type", "n_qubits"], ascending=[True, True, False]).drop(columns="_order")
+    tmp = SUMMARY_PATH.with_suffix(".tmp")
+    all_results.to_csv(tmp, index=False)
+    os.replace(tmp, SUMMARY_PATH)
+    print(f"Held-out test: {dataset_name} / {model_name} / {n_qubits}q: "
+          f"{result['accuracy']:.2%} accuracy, {result['balanced_accuracy']:.2%} balanced; "
+          f"saved to {SUMMARY_PATH}")
+    return result
+
 
 # ============================================================
 # 22. MAIN
@@ -3118,20 +3280,32 @@ def main():
             "consistent tensors and valid CPU-side telemetry."
         )
 
+    if AUDIT_ONLY:
+        root = Path(os.getenv("TINY_IMAGENET_ROOT", str(DATA_ROOT / "tiny-imagenet-200")))
+        TinyImageNetValidation(root, transform=None)
+        print("AUDIT_ONLY=1: dataset verified; no training, inference, or checkpoint changes.")
+        return
+
     for dataset_name in selected:
         config = DATASET_CONFIGS[dataset_name]
         print(f"\n{'=' * 72}\nDataset: {dataset_name} ({config['num_classes']} classes)\n{'=' * 72}")
         train_dataset, test_dataset = load_dataset_pair(dataset_name, config)
 
         for model_name in QUANTUM_MODELS:
-            model, checkpoint_path = get_or_train_model(
-                model_name=model_name,
-                dataset_name=dataset_name,
-                train_dataset=train_dataset,
-                mean=config["mean"],
-                std=config["std"],
-                n_classes=config["num_classes"],
-            )
+            try:
+                model, checkpoint_path = get_or_train_model(
+                    model_name=model_name,
+                    dataset_name=dataset_name,
+                    train_dataset=train_dataset,
+                    mean=config["mean"],
+                    std=config["std"],
+                    n_classes=config["num_classes"],
+                )
+            except FileNotFoundError as exc:
+                if EVAL_ONLY:
+                    print(f"SKIPPING unavailable checkpoint: {exc}")
+                    continue
+                raise
             collect_for_model(
                 base_dataset=test_dataset,
                 model=model,

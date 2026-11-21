@@ -1,661 +1,663 @@
-# Full official training split is used by default (TRAIN_SAMPLES=0,
-# VALIDATION_FRACTION=0), with a default five-qubit quantum head.
-# Existing partial-run checkpoints remain separate.
-# Official test/validation split is reserved for telemetry evaluation.
-"""Hybrid YOLO26n classification + PennyLane 4-layer, 5-qubit VQC.
-Supports MNIST, FashionMNIST, KMNIST, CIFAR100 and TinyImageNet200.
-Auto-trains missing dataset-specific checkpoints; evaluates official held-out splits.
-Keeps original unified telemetry schema and resumes incomplete CSVs.
+#!/usr/bin/env python3
+"""Pretrained YOLO26n-CLS: 5-qubit PennyLane vs two matched classical controls.
 
-Quantum circuit is simulated on a classical CPU (not a physical QPU).
+Features:
+- Models: quantum, classical_bottleneck, classical_standard.
+- Pretrained ImageNet YOLO26n-CLS backbone for every configuration.
+- Stage 1: train new head with a frozen backbone.
+- Stage 2: fine-tune backbone at a lower learning rate.
+- Stratified reproducible validation split; official held-out test/val only once.
+- Complete Tiny ImageNet audit (200 classes, 100000 training, 10000 validation).
+- Resume from last-epoch checkpoints; save best validation weights separately.
+- Metrics, per-sample predictions, and confusion matrices; NO energy telemetry.
+
+Examples:
+  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100
+  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100 TinyImageNet200 --models quantum classical_bottleneck classical_standard
+  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100 --train-samples 1000 --test-samples 100 --head-epochs 1 --finetune-epochs 1
+  python train_improved_hybrid_yolo26n_5q.py --datasets CIFAR100 --eval-only
+
+The quantum circuit uses classical CPU simulation; no quantum processor is used.
+Do not compare telemetry collected here against earlier randomly initialized architectures
+without distinguishing training conditions and hardware.
 """
 from __future__ import annotations
-import os, sys, time, random, hashlib, platform, socket
+
+import argparse
+import copy
+import csv
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+import time
+from collections import Counter
 from pathlib import Path
-from PIL import Image
+
 import numpy as np
 import pandas as pd
-import psutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pennylane as qml
+from PIL import Image
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
+                             confusion_matrix, f1_score, precision_score,
+                             recall_score)
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from tqdm.auto import tqdm
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from ultralytics import YOLO
 
-SEED=int(os.getenv('RANDOM_SEED','42'))
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-DATA_ROOT=Path(os.getenv('DATA_ROOT','./data'))
-TINY_ROOT=Path(os.getenv('TINY_IMAGENET_ROOT',str(DATA_ROOT/'tiny-imagenet-200')))
-CHECKPOINT_DIR=Path(os.getenv('CHECKPOINT_DIR','./quantum_checkpoints'))
-CHECKPOINT_DIR.mkdir(parents=True,exist_ok=True)
-EPOCHS=int(os.getenv('TRAIN_EPOCHS','10'))
-TRAIN_SAMPLES=int(os.getenv('TRAIN_SAMPLES','0'))  # 0 = entire official training split (default)
-NUM_TEST_SAMPLES=int(os.getenv('NUM_TEST_SAMPLES','10'))  # 0 = entire held-out test split
-VALIDATION_FRACTION=float(os.getenv('VALIDATION_FRACTION','0'))  # 0 = no holdout from training (default)
-TRAIN_BATCH_SIZE=int(os.getenv('TRAIN_BATCH_SIZE','8'))
-NUM_WORKERS=int(os.getenv('NUM_WORKERS','0'))
-LR=float(os.getenv('LEARNING_RATE','0.001'))
-WEIGHT_DECAY=float(os.getenv('WEIGHT_DECAY','0.0005'))
-IMG_SIZE=int(os.getenv('IMG_SIZE','64'))
-N_QUBITS=int(os.getenv('N_QUBITS','5'))  # default: five simulated qubits
-N_Q_LAYERS=4
-ACTIVE_CLASSES=10
-PENNYLANE_DEVICE=os.getenv('PENNYLANE_DEVICE','default.qubit')
-FORCE_RETRAIN=os.getenv('FORCE_RETRAIN','0')=='1'
-DEVICE=torch.device('cpu')  # default.qubit + torch interface are CPU based; stable telemetry
-SELECTED_DATASETS=[x.strip() for x in os.getenv('DATASETS','MNIST,FashionMNIST,KMNIST,CIFAR100,TinyImageNet200').split(',') if x.strip()]
-DATASET_CONFIGS={
- 'MNIST':(datasets.MNIST,'mnist',10),
- 'FashionMNIST':(datasets.FashionMNIST,'fashionmnist',10),
- 'KMNIST':(datasets.KMNIST,'kmnist',10),
- 'CIFAR100':(datasets.CIFAR100,'cifar100',100),
- 'TinyImageNet200':(None,'tinyimagenet200',200),
+try:
+    import pennylane as qml
+    from ultralytics import YOLO
+except ImportError as exc:
+    raise SystemExit(
+        f"Missing dependency: {exc}. Install with: "
+        "pip install ultralytics pennylane torch torchvision scikit-learn pandas pillow tqdm"
+    ) from exc
+
+DATASET_SPEC = {
+    "MNIST": (10, "mnist"),
+    "FashionMNIST": (10, "fashionmnist"),
+    "KMNIST": (10, "kmnist"),
+    "CIFAR10": (10, "cifar10"),
+    "CIFAR100": (100, "cifar100"),
+    "TinyImageNet200": (200, "tinyimagenet200"),
 }
-assert N_QUBITS>=1 and TRAIN_BATCH_SIZE>=1 and IMG_SIZE>=32
-assert EPOCHS>=1 and NUM_TEST_SAMPLES>=0 and TRAIN_SAMPLES>=0
-assert 0 <= VALIDATION_FRACTION < 1
-if not set(SELECTED_DATASETS).issubset(DATASET_CONFIGS):
- raise ValueError(f'Invalid datasets: {SELECTED_DATASETS}')
-
-class TinyImageNetDataset(Dataset):
- def __init__(self, split, transform):
-  wnids_file=TINY_ROOT/'wnids.txt'
-  if not wnids_file.is_file(): raise FileNotFoundError(f'Missing {wnids_file}')
-  wnids=sorted(x.strip() for x in wnids_file.read_text().splitlines() if x.strip())
-  if len(wnids)!=200: raise ValueError('Expected exactly 200 Tiny ImageNet WNIDs')
-  lut={w:i for i,w in enumerate(wnids)}
-  self.samples=[]; self.transform=transform
-  if split=='train':
-   for w in wnids:
-    folder=TINY_ROOT/'train'/w/'images'
-    for p in sorted(folder.glob('*')):
-     if p.suffix.lower() in ('.jpg','.jpeg','.png'):
-      self.samples.append((p,lut[w]))
-  elif split=='test':
-   ann=TINY_ROOT/'val'/'val_annotations.txt'
-   if not ann.is_file(): raise FileNotFoundError(f'Missing {ann}')
-   for line in ann.read_text().splitlines():
-    fields=line.split()
-    if len(fields)>=2 and fields[1] in lut:
-     p=TINY_ROOT/'val'/'images'/fields[0]
-     if p.is_file(): self.samples.append((p,lut[fields[1]]))
-  else: raise ValueError(split)
-  if not self.samples: raise FileNotFoundError(f'No Tiny ImageNet images for {split}')
- def __len__(self): return len(self.samples)
- def __getitem__(self, idx):
-  p,y=self.samples[idx]
-  with Image.open(p) as im: x=self.transform(im.convert('RGB'))
-  return x,y
-
-def get_dataset(name, train):
- cfg=DATASET_CONFIGS[name]
- transform=transforms.Compose([transforms.Resize((IMG_SIZE,IMG_SIZE)),transforms.Lambda(lambda im: im.convert('RGB')),transforms.ToTensor()])
- if name=='TinyImageNet200': return TinyImageNetDataset('train' if train else 'test',transform)
- return cfg[0](root=str(DATA_ROOT),train=train,download=True,transform=transform)
-
-def make_loaders(name):
- all_train=get_dataset(name,True)
- if TRAIN_SAMPLES and TRAIN_SAMPLES<len(all_train):
-  rng=np.random.default_rng(SEED)
-  idx=rng.choice(len(all_train),size=TRAIN_SAMPLES,replace=False).tolist()
-  all_train=Subset(all_train,idx)
- n=len(all_train)
- if n<1: raise ValueError('No training images found')
- # Default: use the COMPLETE official training split without a validation holdout.
- if VALIDATION_FRACTION > 0:
-  if n<2: raise ValueError('At least two images required for a validation split')
-  n_val=max(1,round(n*VALIDATION_FRACTION))
-  n_val=min(n_val,n-1)
-  train,val=torch.utils.data.random_split(all_train,[n-n_val,n_val],generator=torch.Generator().manual_seed(SEED))
- else:
-  train,val=all_train,None
- test=get_dataset(name,False)
- if NUM_TEST_SAMPLES: test=Subset(test,range(min(NUM_TEST_SAMPLES,len(test))))
- kw=dict(batch_size=TRAIN_BATCH_SIZE,num_workers=NUM_WORKERS)
- train_loader=DataLoader(train,shuffle=True,**kw)
- val_loader=DataLoader(val,shuffle=False,**kw) if val is not None else None
- test_loader=DataLoader(test,shuffle=False,**kw)
- print(f'{name}: training={len(train)}, validation={len(val) if val is not None else 0}, test={len(test)}')
- return train_loader,val_loader,test_loader
-
-# Each qnode is executed sample-by-sample, with four trainable layers.
-def make_qnode(n_qubits):
- dev=qml.device(PENNYLANE_DEVICE,wires=n_qubits)
- @qml.qnode(dev,interface='torch',diff_method='best')
- def circuit(x,weights):
-  for wire in range(n_qubits):
-   qml.RY(x[wire],wires=wire)
-   qml.RZ(x[wire],wires=wire)
-  for layer in range(N_Q_LAYERS):
-   for wire in range(n_qubits):
-    qml.Rot(*weights[layer,wire],wires=wire)
-   if n_qubits>1:
-    # Neighbor chain, no duplicate reverse CNOT for the two-qubit case.
-    for wire in range(n_qubits-1):
-     qml.CNOT(wires=[wire,wire+1])
-  return [qml.expval(qml.PauliZ(wire)) for wire in range(n_qubits)]
- return circuit
-
-class QuantumYOLOHead(nn.Module):
- def __init__(self,in_features,num_classes,n_qubits=N_QUBITS):
-  super().__init__()
-  self.n_qubits=n_qubits
-  self.feature_to_qubits=nn.Linear(in_features,n_qubits)
-  self.q_weights=nn.Parameter(torch.randn(N_Q_LAYERS,n_qubits,3)*0.01)
-  self.classifier=nn.Linear(n_qubits,num_classes)
-  self.qnode=make_qnode(n_qubits)
- def forward(self,x):
-  if x.ndim==1: x=x.unsqueeze(0)
-  angles=torch.tanh(self.feature_to_qubits(x))*torch.pi
-  rows=[]
-  for one in angles:
-   out=self.qnode(one,self.q_weights)
-   if isinstance(out,torch.Tensor): features=out.reshape(-1)
-   else: features=torch.stack(list(out)).reshape(-1)
-   rows.append(features.to(dtype=self.classifier.weight.dtype))
-  return self.classifier(torch.stack(rows,0))
-
-def get_last_linear(model):
- matches=[(name,module) for name,module in model.named_modules() if isinstance(module,nn.Linear)]
- if not matches: raise RuntimeError('YOLO classification model has no nn.Linear; check Ultralytics version')
- name,layer=matches[-1]
- parent=model
- for key in name.split('.')[:-1]: parent=parent[int(key)] if key.isdecimal() else getattr(parent,key)
- return parent,name.split('.')[-1],layer
-
-def build_model(n_classes):
- yolo=YOLO('yolo26n-cls.yaml')
- model=yolo.model
- parent,key,old=get_last_linear(model)
- new=QuantumYOLOHead(old.in_features,n_classes)
- if key.isdecimal(): parent[int(key)]=new
- else: setattr(parent,key,new)
- return model.to(DEVICE)
-
-def get_logits(output,n_classes):
- if isinstance(output,torch.Tensor):
-  if output.ndim==2 and output.shape[1]==n_classes: return output
- if isinstance(output,(tuple,list)):
-  # Ultralytics Classify.forward(eval) generally returns (probs, logits).
-  tensors=[x for x in output if isinstance(x,torch.Tensor) and x.ndim==2 and x.shape[1]==n_classes]
-  if tensors: return tensors[-1]  # logits preferred, not probabilities
- if isinstance(output,dict):
-  for key in ('logits','preds','output'):
-   if key in output: return get_logits(output[key],n_classes)
- raise RuntimeError(f'Unexpected YOLO logits format: {type(output)}')
-
-def checkpoint_path(dataset_key, train_count):
- return CHECKPOINT_DIR/f'hybrid_yolo26n_{dataset_key}_{N_QUBITS}q_{N_Q_LAYERS}layers_{IMG_SIZE}px_train{train_count}_v3.pth'
-
-def load_or_train(name,key,n_classes,train_loader,val_loader):
- train_count=len(train_loader.dataset)
- path=checkpoint_path(key,train_count)
- model=build_model(n_classes)
- if path.exists() and not FORCE_RETRAIN:
-  try: ck=torch.load(path,map_location='cpu',weights_only=True)
-  except TypeError: ck=torch.load(path,map_location='cpu')
-  if ck.get('n_classes')!=n_classes or ck.get('n_qubits')!=N_QUBITS or ck.get('train_count')!=train_count:
-   raise RuntimeError(f'Checkpoint shape mismatch: {path}')
-  model.load_state_dict(ck['state_dict'],strict=True)
-  print(f'Loaded {path}')
-  return model.eval(),path
- loss_fn=nn.CrossEntropyLoss()
- opt=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WEIGHT_DECAY)
- best=-1.0
- for epoch in range(1,EPOCHS+1):
-  model.train()
-  train_ok=train_n=0
-  for x,y in tqdm(train_loader,desc=f'{name} training {epoch}/{EPOCHS}'):
-   x=x.to(DEVICE); y=y.to(DEVICE)
-   opt.zero_grad(set_to_none=True)
-   logits=get_logits(model(x),n_classes)
-   loss=loss_fn(logits,y)
-   loss.backward(); opt.step()
-   train_ok+=int((logits.argmax(1)==y).sum()); train_n+=len(y)
-  train_acc=train_ok/max(train_n,1)
-  if val_loader is not None:
-   model.eval(); val_ok=val_n=0
-   with torch.no_grad():
-    for x,y in val_loader:
-     logits=get_logits(model(x.to(DEVICE)),n_classes)
-     val_ok+=int((logits.argmax(1)==y.to(DEVICE)).sum()); val_n+=len(y)
-   val_acc=val_ok/max(val_n,1)
-   print(f'{name} epoch={epoch} train_acc={train_acc:.4f} val_acc={val_acc:.4f}')
-   should_save=val_acc>best
-   if should_save: best=val_acc
-  else:
-   val_acc=None
-   should_save=True  # Without validation, save the latest fully trained epoch.
-   print(f'{name} epoch={epoch} train_acc={train_acc:.4f} (full training; no validation holdout)')
-  if should_save:
-   torch.save({'state_dict':model.state_dict(),'n_classes':n_classes,
-               'n_qubits':N_QUBITS,'epoch':epoch,'val_acc':val_acc,
-               'train_count':train_count,'validation_fraction':VALIDATION_FRACTION},path)
- try: ck=torch.load(path,map_location='cpu',weights_only=True)
- except TypeError: ck=torch.load(path,map_location='cpu')
- model.load_state_dict(ck['state_dict'],strict=True)
- return model.eval(),path
-
-def get_cpu_model():
-    try:
-        import cpuinfo
-        return cpuinfo.get_cpu_info().get("brand_raw", "Unknown")
-    except Exception:
-        return platform.processor() or "Unknown"
-
-CPU_MODEL_NAME = get_cpu_model()
-CPU_ARCH = platform.machine()
-CPU_TDP_W = None
-PYTHON_VERSION = sys.version.split()[0]
-TORCH_VERSION = torch.__version__
-OS_NAME = platform.system()
-OS_VERSION = platform.version()
-OS_ARCHITECTURE = platform.machine()
-SYSTEM_RAM_TOTAL_GB = round(psutil.virtual_memory().total / (1024 ** 3), 2)
-CPU_CORE_COUNT = psutil.cpu_count(logical=False)
-CPU_THREAD_COUNT = psutil.cpu_count(logical=True)
+MODEL_KINDS = ("quantum", "classical_bottleneck", "classical_standard")
 
 
-def get_os_full_name():
-    system = platform.system()
-    architecture = platform.machine()
-    if system == "Windows":
-        return f"Windows {platform.release()} {architecture}"
-    if system == "Linux":
-        try:
-            info = {}
-            with open("/etc/os-release", "r", encoding="utf-8") as f:
-                for line in f:
-                    if "=" in line:
-                        k, v = line.strip().split("=", 1)
-                        info[k] = v.strip('"')
-            return f"{info.get('PRETTY_NAME', 'Linux')} {architecture}"
-        except Exception:
-            return f"Linux {platform.release()} {architecture}"
-    if system == "Darwin":
-        return f"macOS {platform.mac_ver()[0]} {architecture}"
-    return f"{system} {platform.release()} {architecture}"
-
-OS_FULL_NAME = get_os_full_name()
-
-
-def make_stable_device_id():
-    raw = f"{socket.gethostname()}-{platform.system()}-{platform.machine()}-{CPU_MODEL_NAME}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-DEVICE_UUID = make_stable_device_id()
-DEVICE_SHORT = DEVICE_UUID[:8]
-OUTPUT_ROOT = Path.cwd() / "test_results"
-OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-DEVICE_LOG_DIR = OUTPUT_ROOT / DEVICE_SHORT
-DEVICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def get_hostname():
-    return socket.gethostname()
-
-try:
-    from codecarbon import EmissionsTracker
-    import codecarbon
-    CODECARBON_AVAILABLE = True
-    CODECARBON_VERSION = codecarbon.__version__
-except Exception:
-    EmissionsTracker = None
-    CODECARBON_AVAILABLE = False
-    CODECARBON_VERSION = "unavailable"
-    print("CodeCarbon unavailable. Energy values will be 0.")
-
-try:
-    import pynvml
-    pynvml.nvmlInit()
-    NVML_AVAILABLE = True
-    NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0) if torch.cuda.is_available() else None
-except Exception:
-    NVML_AVAILABLE = False
-    NVML_HANDLE = None
-    print("pynvml unavailable.")
-
-
-def get_cuda_driver_version():
-    if not NVML_AVAILABLE:
-        return None
-    try:
-        v = pynvml.nvmlSystemGetDriverVersion()
-        return v.decode("utf-8") if isinstance(v, bytes) else v
-    except Exception:
-        return None
-
-CUDA_DRIVER_VERSION = get_cuda_driver_version()
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--datasets", nargs="+", choices=list(DATASET_SPEC), default=list(DATASET_SPEC))
+    parser.add_argument("--models", nargs="+", choices=MODEL_KINDS,
+                        default=["quantum", "classical_bottleneck", "classical_standard"])
+    parser.add_argument("--data-root", type=Path, default=Path("./data"))
+    parser.add_argument("--tiny-root", type=Path, default=None)
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("quantum_checkpoints/pretrained_10q"))
+    parser.add_argument("--output-dir", type=Path, default=Path("evaluation_results/pretrained_10q"))
+    parser.add_argument("--pretrained-weights", default="yolo26n-cls.pt")
+    parser.add_argument("--image-size", type=int, default=224,
+                        help="Pretrained model's standard classification resolution; same for all models")
+    parser.add_argument("--qubits", type=int, default=10)
+    parser.add_argument("--quantum-layers", type=int, default=4)
+    parser.add_argument("--head-epochs", type=int, default=10)
+    parser.add_argument("--finetune-epochs", type=int, default=30)
+    parser.add_argument("--head-lr", type=float, default=1e-3)
+    parser.add_argument("--backbone-lr", type=float, default=1e-5)
+    parser.add_argument("--head-finetune-lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--train-samples", type=int, default=0,
+                        help="0 uses complete official training set before validation split")
+    parser.add_argument("--test-samples", type=int, default=0,
+                        help="0 evaluates complete official test set")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["cpu", "auto", "cuda"], default="cpu")
+    parser.add_argument("--eval-only", action="store_true", help="Evaluate saved best checkpoint; NEVER train")
+    parser.add_argument("--no-augmentation", action="store_true")
+    # Jupyter adds -f kernel.json. Do not ignore ordinary CLI errors.
+    argv = sys.argv[1:]
+    if "ipykernel" in sys.modules:
+        clean = []
+        i = 0
+        while i < len(argv):
+            value = argv[i]
+            if value in ("-f", "--f"):
+                i += 2
+            elif re.match(r"^(?:-f|--f)=.*\.json$", value):
+                i += 1
+            else:
+                clean.append(value)
+                i += 1
+        argv = clean
+    args = parser.parse_args(argv)
+    if args.qubits < 1 or args.quantum_layers < 1:
+        parser.error("--qubits and --quantum-layers must be positive")
+    if args.batch_size < 1 or args.workers < 0 or args.image_size < 64:
+        parser.error("Invalid batch-size/workers/image-size")
+    if args.head_epochs < 0 or args.finetune_epochs < 0 or (args.head_epochs + args.finetune_epochs == 0 and not args.eval_only):
+        parser.error("At least one stage must have a positive number of epochs")
+    if not 0 < args.val_fraction < 1:
+        parser.error("A positive validation fraction is required to select best checkpoints without test leakage")
+    if args.train_samples < 0 or args.test_samples < 0:
+        parser.error("Sample limits must be nonnegative")
+    args.data_root = args.data_root.expanduser().resolve()
+    args.tiny_root = (args.tiny_root or args.data_root / "tiny-imagenet-200").expanduser().resolve()
+    args.checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
+    args.output_dir = args.output_dir.expanduser().resolve()
+    return args
 
 
-def get_gpu_static():
-    result = {
-        "gpu_driver_version": CUDA_DRIVER_VERSION,
-        "gpu_compute_capability": None,
-        "gpu_power_limit_w": None,
-        "gpu_memory_total_mb": None,
-    }
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        try:
-            props = torch.cuda.get_device_properties(0)
-            result["gpu_compute_capability"] = f"{props.major}.{props.minor}"
-        except Exception:
-            pass
-    if not NVML_AVAILABLE or NVML_HANDLE is None:
-        return result
-    try:
-        result["gpu_power_limit_w"] = round(pynvml.nvmlDeviceGetPowerManagementLimit(NVML_HANDLE) / 1000.0, 2)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(NVML_HANDLE)
-        result["gpu_memory_total_mb"] = round(mem.total / (1024 ** 2), 2)
-    except Exception:
-        pass
-    return result
-
-GPU_STATIC = get_gpu_static()
+        torch.cuda.manual_seed_all(seed)
 
 
-def get_gpu_core_thread():
-    if not torch.cuda.is_available():
-        return None, None
-    try:
-        props = torch.cuda.get_device_properties(0)
-        sm = props.multi_processor_count
-        cpsm = {2:32,3:192,5:128,6:64,7:64,8:128,9:128}.get(props.major,64)
-        return sm*cpsm, sm*props.max_threads_per_multi_processor
-    except Exception:
-        return None, None
-
-GPU_CORE_COUNT, GPU_THREAD_COUNT = get_gpu_core_thread()
+def get_device(args):
+    if args.device == "auto":
+        selected = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        selected = args.device
+    if selected == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    if "quantum" in args.models and selected != "cpu":
+        raise RuntimeError("For fair CPU-based simulated-quantum comparison, use --device cpu")
+    return torch.device(selected)
 
 
-def get_gpu_name():
-    try:
-        return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU"
-    except Exception:
-        return "Unknown"
+class TinyImageNet(Dataset):
+    def __init__(self, root: Path, split: str, transform=None):
+        self.transform = transform
+        self.samples = []
+        self.root = root
+        ids_path = root / "wnids.txt"
+        if not ids_path.is_file():
+            raise FileNotFoundError(f"Tiny ImageNet class index missing: {ids_path}")
+        classes = sorted(x.strip() for x in ids_path.read_text(encoding="utf-8").splitlines() if x.strip())
+        if len(classes) != 200 or len(set(classes)) != 200:
+            raise ValueError("Tiny ImageNet wnids.txt must contain 200 distinct classes")
+        mapping = {c: i for i, c in enumerate(classes)}
+        self.targets = []
+        if split == "train":
+            for wnid in classes:
+                folder = root / "train" / wnid / "images"
+                paths = sorted(p for p in folder.glob("*") if p.suffix.lower() in (".jpeg", ".jpg", ".png"))
+                if len(paths) != 500:
+                    raise RuntimeError(f"Tiny ImageNet training class {wnid}: expected 500 images, got {len(paths)} in {folder}")
+                self.samples.extend((p, mapping[wnid]) for p in paths)
+        elif split == "val":
+            annotations = root / "val" / "val_annotations.txt"
+            if not annotations.is_file():
+                raise FileNotFoundError(f"Tiny ImageNet validation annotations missing: {annotations}")
+            lines = annotations.read_text(encoding="utf-8").splitlines()
+            if len(lines) != 10_000:
+                raise RuntimeError(f"Tiny ImageNet validation expected 10000 annotations, found {len(lines)}")
+            missing = []
+            for line in lines:
+                fields = line.split()
+                if len(fields) < 2 or fields[1] not in mapping:
+                    raise RuntimeError(f"Invalid Tiny ImageNet annotation: {line}")
+                path = root / "val" / "images" / fields[0]
+                if not path.is_file():
+                    missing.append(str(path))
+                self.samples.append((path, mapping[fields[1]]))
+            counts = Counter(label for _, label in self.samples)
+            if len(counts) != 200 or any(counts.get(i, 0) != 50 for i in range(200)):
+                raise RuntimeError("Tiny ImageNet validation must have exactly 50 images in each of 200 classes")
+            if len(set(str(p) for p, _ in self.samples)) != 10_000:
+                raise RuntimeError("Tiny ImageNet validation has duplicate annotation filenames")
+            if missing:
+                raise RuntimeError(f"Tiny ImageNet validation is incomplete ({len(missing)} files missing). "
+                                   f"First missing: {missing[:5]}")
+            # Fixed canonical order ensures sample IDs consistently map to images.
+            self.samples.sort(key=lambda x: x[0].name)
+        else:
+            raise ValueError(split)
+        self.targets = [label for _, label in self.samples]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        path, label = self.samples[i]
+        with Image.open(path) as img:
+            image = img.convert("RGB")
+            return self.transform(image) if self.transform else image, label
 
 
-def get_cpu_usage():
-    try: return psutil.cpu_percent(interval=None)
-    except Exception: return None
+class ApplyTransform(Dataset):
+    """Same underlying official examples with train vs eval transforms."""
+    def __init__(self, base, indices, transform):
+        self.base = base
+        self.indices = [int(i) for i in indices]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        image, target = self.base[self.indices[i]]
+        return self.transform(image), int(target)
 
 
-def get_cpu_freq():
-    try:
-        f = psutil.cpu_freq()
-        return round(f.current, 2) if f else None
-    except Exception: return None
+def build_transforms(size, augmentation, dataset_name):
+    # Pretrained YOLO cls weights were optimized on ImageNet-like image colors.
+    # Inputs are RGB 0..1; same transforms for quantum and classical controls.
+    eval_transform = transforms.Compose([
+        transforms.Resize((size, size)), transforms.ToTensor(),
+    ])
+    # Horizontal flipping would change the meaning of some handwritten digits.
+    augmentations = []
+    if augmentation:
+        if dataset_name in ("MNIST", "FashionMNIST", "KMNIST"):
+            augmentations = [transforms.RandomRotation(degrees=8)]
+        else:
+            augmentations = [transforms.RandomHorizontalFlip(p=0.5),
+                             transforms.RandomRotation(degrees=8)]
+    train_transform = transforms.Compose([
+        transforms.Resize((size, size)), *augmentations, transforms.ToTensor(),
+    ])
+    return train_transform, eval_transform
 
 
-def get_cpu_temp():
-    try:
-        temps = psutil.sensors_temperatures()
-        if not temps: return None
-        for key in ("coretemp","k10temp","cpu_thermal","acpitz"):
-            if key in temps:
-                vals=[x.current for x in temps[key] if x.current is not None and x.current>0]
-                if vals: return round(sum(vals)/len(vals),1)
-    except Exception: pass
-    return None
+def dataset_base(name, is_train, args):
+    if name == "TinyImageNet200":
+        return TinyImageNet(args.tiny_root, "train" if is_train else "val", transform=None)
+    ds_cls = {"MNIST": datasets.MNIST, "FashionMNIST": datasets.FashionMNIST,
+              "KMNIST": datasets.KMNIST, "CIFAR100": datasets.CIFAR100}[name]
+    return ds_cls(root=str(args.data_root), train=is_train, download=True, transform=None)
 
 
-def get_cpu_power_draw_w():
-    return None
+def label_array(ds):
+    if hasattr(ds, "targets"):
+        return np.asarray(ds.targets, dtype=np.int64)
+    return np.asarray([int(ds[i][1]) for i in range(len(ds))], dtype=np.int64)
 
 
-def get_cpu_cores_used():
-    try: return sum(1 for x in psutil.cpu_percent(percpu=True) if x > 1.0)
-    except Exception: return None
+def dataset_loaders(name, args):
+    train_base = dataset_base(name, True, args)
+    test_base = dataset_base(name, False, args)
+    labels = label_array(train_base)
+    indices = np.arange(len(labels))
+    # Sample at most train_samples, with reproducible stratification by class.
+    rng = np.random.default_rng(args.seed)
+    if args.train_samples and args.train_samples < len(indices):
+        selected = []
+        # approximately balanced class sampling if using a restricted subset
+        n_class = DATASET_SPEC[name][0]
+        base_quota = args.train_samples // n_class
+        extra = args.train_samples % n_class
+        for c in range(n_class):
+            ids = indices[labels == c]
+            chosen = rng.choice(ids, size=min(len(ids), base_quota + int(c < extra)), replace=False)
+            selected.extend(int(x) for x in chosen)
+        if len(selected) != args.train_samples:
+            raise ValueError("Subset sampling failed to cover all requested examples")
+        indices = np.asarray(selected, dtype=np.int64)
+    # Avoid split failure if a tiny debug sample contains fewer than two examples per class.
+    from sklearn.model_selection import train_test_split
+    class_counts = Counter(labels[indices].tolist())
+    if min(class_counts.values()) < 2:
+        raise ValueError("Need at least two training examples per class for stratified validation; increase --train-samples")
+    train_idx, val_idx = train_test_split(indices, test_size=args.val_fraction,
+                                           stratify=labels[indices], random_state=args.seed)
+    train_t, eval_t = build_transforms(args.image_size, not args.no_augmentation, name)
+    # ImageNet pretrained conv backbone expects 3-channel RGB.
+    to_rgb = transforms.Lambda(lambda image: image.convert("RGB"))
+    train_t.transforms.insert(0, to_rgb)
+    eval_t.transforms.insert(0, to_rgb)
+    train_ds = ApplyTransform(train_base, train_idx, train_t)
+    val_ds = ApplyTransform(train_base, val_idx, eval_t)
+    test_indices = np.arange(len(test_base))
+    if args.test_samples:
+        test_indices = test_indices[:args.test_samples]
+    test_ds = ApplyTransform(test_base, test_indices, eval_t)
+    kwargs = dict(batch_size=args.batch_size, num_workers=args.workers,
+                  pin_memory=False)
+    train_dl = DataLoader(train_ds, shuffle=True, **kwargs)
+    val_dl = DataLoader(val_ds, shuffle=False, **kwargs)
+    test_dl = DataLoader(test_ds, shuffle=False, **kwargs)
+    print(f"{name}: train={len(train_ds)}, validation={len(val_ds)}, test={len(test_ds)} ",
+          f"(official test={len(test_base)}); all {DATASET_SPEC[name][0]} classes")
+    return train_dl, val_dl, test_dl, len(train_base), len(test_base)
 
 
-def get_memory_footprint_mb():
-    try: return round(psutil.Process(os.getpid()).memory_info().rss/(1024**2),4)
-    except Exception: return None
+def circuit_factory(n_qubits, n_layers):
+    device = qml.device("default.qubit", wires=n_qubits)
+    @qml.qnode(device, interface="torch", diff_method="best")
+    def circuit(x, weights):
+        # Angle encoding at every layer = data re-uploading.
+        for layer in range(n_layers):
+            for q in range(n_qubits):
+                qml.RY(x[q], wires=q)
+                qml.RZ(x[q], wires=q)
+                qml.Rot(weights[layer, q, 0], weights[layer, q, 1],
+                        weights[layer, q, 2], wires=q)
+            if n_qubits > 1:
+                for q in range(n_qubits - 1):
+                    qml.CNOT(wires=[q, q + 1])
+                if n_qubits > 2:
+                    qml.CNOT(wires=[n_qubits - 1, 0])
+        return [qml.expval(qml.PauliZ(q)) for q in range(n_qubits)]
+    return circuit
 
 
-def get_gpu_metrics():
-    out={"gpu_power_draw_w":None,"gpu_utilization_pct":None,"gpu_temp_c":None,"gpu_memory_used_mb":None,"gpu_sm_clock_mhz":None,"gpu_memory_clock_mhz":None}
-    if not NVML_AVAILABLE or NVML_HANDLE is None: return out
-    try:
-        power=pynvml.nvmlDeviceGetPowerUsage(NVML_HANDLE)
-        util=pynvml.nvmlDeviceGetUtilizationRates(NVML_HANDLE)
-        temp=pynvml.nvmlDeviceGetTemperature(NVML_HANDLE,pynvml.NVML_TEMPERATURE_GPU)
-        mem=pynvml.nvmlDeviceGetMemoryInfo(NVML_HANDLE)
-        sm=pynvml.nvmlDeviceGetClockInfo(NVML_HANDLE,pynvml.NVML_CLOCK_SM)
-        mc=pynvml.nvmlDeviceGetClockInfo(NVML_HANDLE,pynvml.NVML_CLOCK_MEM)
-        return {"gpu_power_draw_w":round(power/1000.0,2),"gpu_utilization_pct":util.gpu,"gpu_temp_c":temp,"gpu_memory_used_mb":round(mem.used/(1024**2),2),"gpu_sm_clock_mhz":sm,"gpu_memory_clock_mhz":mc}
-    except Exception: return out
+class QuantumHead(nn.Module):
+    def __init__(self, in_features, n_classes, n_qubits, n_layers):
+        super().__init__()
+        self.feature_to_qubits = nn.Linear(in_features, n_qubits)
+        self.q_weights = nn.Parameter(0.01 * torch.randn(n_layers, n_qubits, 3))
+        self.classifier = nn.Linear(n_qubits, n_classes)
+        self.qnode = circuit_factory(n_qubits, n_layers)
+
+    def forward(self, x):
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        angles = torch.tanh(self.feature_to_qubits(x)) * torch.pi
+        outputs = []
+        for one in angles:
+            values = self.qnode(one, self.q_weights)
+            if isinstance(values, torch.Tensor):
+                q_out = values.reshape(-1)
+            else:
+                q_out = torch.stack(list(values)).reshape(-1)
+            outputs.append(q_out.to(dtype=self.classifier.weight.dtype))
+        return self.classifier(torch.stack(outputs, dim=0))
 
 
-def get_prediction_quality(logits):
-    probs = F.softmax(logits.float(), dim=-1).squeeze()
-    confidence_score = float(probs.max().item())
-    top2 = torch.topk(logits.float().squeeze(), k=2).values
-    logit_margin = float((top2[0]-top2[1]).item())
-    entropy = float(-(probs*torch.log(probs+1e-12)).sum().item())
-    return round(confidence_score,6), round(logit_margin,6), round(entropy,6)
+class BottleneckControl(nn.Module):
+    def __init__(self, in_features, n_classes, width):
+        super().__init__()
+        self.feature_to_qubits = nn.Linear(in_features, width)
+        self.classifier = nn.Linear(width, n_classes)
+
+    def forward(self, x):
+        return self.classifier(torch.tanh(self.feature_to_qubits(x)))
 
 
-def run_single_inference_with_telemetry(model, image, dataset_key):
-    energy_dir = OUTPUT_ROOT / "codecarbon"
-    energy_dir.mkdir(parents=True, exist_ok=True)
-    tracker = None
-    if CODECARBON_AVAILABLE:
-        tracker = EmissionsTracker(
-            project_name=f"yolo_{N_QUBITS}qubit_{dataset_key}_test",
-            output_dir=str(energy_dir),
-            output_file=f"codecarbon_yolo_{N_QUBITS}qubit_{dataset_key}.csv",
-            log_level="error",
-            save_to_file=True,
-        )
-        tracker.start()
-    if DEVICE.type == "cuda": torch.cuda.synchronize()
-    t0=time.perf_counter()
-    output=model(image)
-    logits=get_logits(output,ACTIVE_CLASSES)
-    if DEVICE.type == "cuda": torch.cuda.synchronize()
-    exec_time=time.perf_counter()-t0
-    cpu_energy=gpu_energy=ram_energy=total_energy=0.0
-    emissions_value=0.0
-    carbon_intensity=None
-    if tracker is not None:
-        emissions_value=tracker.stop()
-        fd=getattr(tracker,"final_emissions_data",None)
-        cpu_energy=float(getattr(fd,"cpu_energy",0) or 0)
-        gpu_energy=float(getattr(fd,"gpu_energy",0) or 0)
-        ram_energy=float(getattr(fd,"ram_energy",0) or 0)
-        total_energy=float(getattr(fd,"energy_consumed",0) or 0)
-        if emissions_value is not None and total_energy>0:
-            carbon_intensity=float(emissions_value)/total_energy
-    return logits,exec_time,cpu_energy,gpu_energy,ram_energy,total_energy,emissions_value,carbon_intensity,get_gpu_metrics()
+def build_model(kind, n_classes, args):
+    # All three contenders start from the identical pretrained architecture.
+    yolo = YOLO(args.pretrained_weights)
+    model = yolo.model
+    candidate = []
+    for path, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            candidate.append((path, mod))
+    if not candidate:
+        raise RuntimeError("Pretrained YOLO classification model contains no final nn.Linear")
+    linear_path, original_linear = candidate[-1]
+    if not linear_path.endswith(".linear"):
+        raise RuntimeError(f"Expected Ultralytics Classify.linear, found {linear_path}. "
+                           "Check installed ultralytics version.")
+    if kind == "quantum":
+        head = QuantumHead(original_linear.in_features, n_classes, args.qubits, args.quantum_layers)
+    elif kind == "classical_bottleneck":
+        head = BottleneckControl(original_linear.in_features, n_classes, args.qubits)
+    elif kind == "classical_standard":
+        head = nn.Linear(original_linear.in_features, n_classes)
+    else:
+        raise ValueError(kind)
+    parent = model
+    keys = linear_path.split(".")
+    for item in keys[:-1]:
+        parent = parent[int(item)] if item.isdigit() else getattr(parent, item)
+    setattr(parent, keys[-1], head)
+    return model, head
 
 
-def build_telemetry_row(model_name,prediction,exec_time,parameters,true_label,sample_index,logits=None,cpu_energy=0,gpu_energy=0,ram_energy=0,total_energy=0,emissions_value=0,carbon_intensity=None,gpu_metrics=None,model_flops=None,quantum_computing=True,dataset_name="MNIST",sample_id=None,checkpoint_path=None,under_attack=False):
-    gpu_metrics=gpu_metrics or {}
-    confidence_score,logit_margin,entropy=(None,None,None)
-    if logits is not None:
-        confidence_score,logit_margin,entropy=get_prediction_quality(logits)
-    total_energy=total_energy or 0.0; cpu_energy=cpu_energy or 0.0; gpu_energy=gpu_energy or 0.0; ram_energy=ram_energy or 0.0
-    input_tokens=IMG_SIZE*IMG_SIZE*3; output_tokens=1; total_tokens=input_tokens+output_tokens
-    joules_per_token=energy_per_token_kwh=watts_estimated=gpu_energy_pct=cpu_energy_pct=0.0
-    if total_energy>0 and total_tokens>0:
-        energy_per_token_kwh=round(total_energy/total_tokens,12)
-        joules_per_token=round((total_energy*3_600_000)/total_tokens,6)
-        if exec_time>0: watts_estimated=round((total_energy*3_600_000)/exec_time,4)
-        gpu_energy_pct=round((gpu_energy/total_energy)*100,2)
-        cpu_energy_pct=round((cpu_energy/total_energy)*100,2)
-    correct=None
-    if true_label is not None and prediction is not None:
-        correct=int(prediction)==int(true_label)
-    return {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "unique_device_id": DEVICE_UUID,
-        "device_short_id": DEVICE_SHORT,
-        "pc_name": get_hostname(),
-        "collection_mode": "automated_edge",
-        "sample_index": sample_index,
-        "sample_id": sample_id if sample_id is not None else sample_index,
-        "true_label": true_label,
-        "prediction": prediction,
-        "correct": correct,
-        "dataset": dataset_name,
-        "model_type": model_name,
-        "parameters": parameters,
-        "model_flops": model_flops,
-        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
-        "confidence_score": confidence_score,
-        "logit_margin": logit_margin,
-        "entropy": entropy,
-        "execution_time_sec": round(exec_time,10),
-        "cpu_energy_kwh": cpu_energy,
-        "gpu_energy_kwh": gpu_energy,
-        "ram_energy_kwh": ram_energy,
-        "total_energy_kwh": total_energy,
-        "total_emissions_kg": emissions_value,
-        "carbon_intensity_kgco2_kwh": carbon_intensity,
-        "codecarbon_version": CODECARBON_VERSION,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-        "tokens_per_second": round(total_tokens/exec_time,4) if exec_time>0 else None,
-        "joules_per_token": joules_per_token,
-        "energy_per_token_kwh": energy_per_token_kwh,
-        "watts_estimated": watts_estimated,
-        "gpu_energy_pct_of_total": gpu_energy_pct,
-        "cpu_energy_pct_of_total": cpu_energy_pct,
-        "cpu_model": CPU_MODEL_NAME,
-        "cpu_architecture": CPU_ARCH,
-        "cpu_core_count": CPU_CORE_COUNT,
-        "cpu_thread_count": CPU_THREAD_COUNT,
-        "cpu_core": CPU_CORE_COUNT,
-        "cpu_thread": CPU_THREAD_COUNT,
-        "cpu_tdp_w": CPU_TDP_W,
-        "cpu_usage_pct": get_cpu_usage(),
-        "cpu_clock_mhz": get_cpu_freq(),
-        "cpu_temp_c": get_cpu_temp(),
-        "cpu_power_draw_w": get_cpu_power_draw_w(),
-        "cpu_cores_used": get_cpu_cores_used(),
-        "gpu_model": get_gpu_name(),
-        "gpu_core": GPU_CORE_COUNT,
-        "gpu_thread": GPU_THREAD_COUNT,
-        "gpu_driver_version": GPU_STATIC["gpu_driver_version"],
-        "gpu_compute_capability": GPU_STATIC["gpu_compute_capability"],
-        "gpu_power_limit_w": GPU_STATIC["gpu_power_limit_w"],
-        "gpu_memory_total_mb": GPU_STATIC["gpu_memory_total_mb"],
-        "gpu_power_draw_w": gpu_metrics.get("gpu_power_draw_w"),
-        "gpu_utilization_pct": gpu_metrics.get("gpu_utilization_pct"),
-        "gpu_temp_c": gpu_metrics.get("gpu_temp_c"),
-        "gpu_memory_used_mb": gpu_metrics.get("gpu_memory_used_mb"),
-        "gpu_sm_clock_mhz": gpu_metrics.get("gpu_sm_clock_mhz"),
-        "gpu_memory_clock_mhz": gpu_metrics.get("gpu_memory_clock_mhz"),
-        "cuda_driver_version": CUDA_DRIVER_VERSION,
-        "cuda_available": torch.cuda.is_available(),
-        "device_type": str(DEVICE),
-        "ram_usage_pct": psutil.virtual_memory().percent,
-        "memory_footprint_mb": get_memory_footprint_mb(),
-        "system_ram_total_gb": SYSTEM_RAM_TOTAL_GB,
-        "os_name": OS_NAME,
-        "os_version": OS_VERSION,
-        "os_architecture": OS_ARCHITECTURE,
-        "os_full_name": OS_FULL_NAME,
-        "python_version": PYTHON_VERSION,
-        "torch_version": TORCH_VERSION,
-        "model_accuracy": None,
-        "model_precision_weighted": None,
-        "model_recall_weighted": None,
-        "model_f1_weighted": None,
-        "quantum_computing": quantum_computing,
-        "model_under_attack": int(bool(under_attack)),
-        "source_qubits": N_QUBITS,
-        "n_qubits": N_QUBITS,
-        "fidelity": None,
-        "pennylane_device": PENNYLANE_DEVICE,
-        "pennylane_version": qml.__version__,
+def logits_from_forward(output, n_classes):
+    # Ultralytics Classify: train -> logits; eval -> (probabilities, logits).
+    if isinstance(output, torch.Tensor):
+        logits = output
+    elif isinstance(output, (tuple, list)) and len(output) >= 2 and isinstance(output[1], torch.Tensor):
+        logits = output[1]
+    elif isinstance(output, dict) and isinstance(output.get("logits"), torch.Tensor):
+        logits = output["logits"]
+    else:
+        raise RuntimeError(f"Unexpected YOLO classification output: {type(output)}")
+    if logits.ndim != 2 or logits.shape[1] != n_classes:
+        raise RuntimeError(f"Invalid classification output shape {tuple(logits.shape)} expected (?, {n_classes})")
+    return logits
+
+
+def set_training_stage(model, head, stage):
+    if stage == "head":
+        # Keep frozen backbone BatchNorm running statistics unchanged.
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in head.parameters():
+            p.requires_grad_(True)
+        model.eval()
+        head.train()
+    elif stage == "finetune":
+        for p in model.parameters():
+            p.requires_grad_(True)
+        model.train()
+    else:
+        raise ValueError(stage)
+
+
+def optimizer_for_stage(model, head, stage, args):
+    if stage == "head":
+        return torch.optim.AdamW(head.parameters(), lr=args.head_lr, weight_decay=args.weight_decay)
+    head_ids = {id(p) for p in head.parameters()}
+    backbone = [p for p in model.parameters() if id(p) not in head_ids]
+    return torch.optim.AdamW([
+        {"params": backbone, "lr": args.backbone_lr},
+        {"params": list(head.parameters()), "lr": args.head_finetune_lr},
+    ], weight_decay=args.weight_decay)
+
+
+def train_epoch(model, head, loader, optimizer, stage, n_classes, device):
+    set_training_stage(model, head, stage)
+    total_loss = correct = count = 0
+    for images, targets in tqdm(loader, desc=f"Train {stage}", leave=False):
+        images, targets = images.to(device), targets.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = logits_from_forward(model(images), n_classes)
+        loss = F.cross_entropy(logits, targets)
+        loss.backward()
+        optimizer.step()
+        batch = len(targets)
+        count += batch
+        total_loss += float(loss.detach().item()) * batch
+        correct += int((logits.argmax(1) == targets).sum().item())
+    return total_loss / max(1, count), correct / max(1, count)
+
+
+@torch.no_grad()
+def validation_epoch(model, loader, n_classes, device):
+    model.eval()
+    loss_sum = correct = count = 0
+    for images, targets in tqdm(loader, desc="Validation", leave=False):
+        images, targets = images.to(device), targets.to(device)
+        logits = logits_from_forward(model(images), n_classes)
+        batch = len(targets)
+        loss_sum += float(F.cross_entropy(logits, targets).item()) * batch
+        correct += int((logits.argmax(1) == targets).sum().item())
+        count += batch
+    return loss_sum / max(1, count), correct / max(1, count)
+
+
+def checkpoint_paths(name, kind, args):
+    prefix = (f"{DATASET_SPEC[name][1]}_{kind}_{args.qubits}q_"
+              f"{args.quantum_layers}layers_{args.image_size}px_seed{args.seed}_"
+              f"pretrained_v1")
+    return (args.checkpoint_dir / f"{prefix}_last.pth",
+            args.checkpoint_dir / f"{prefix}_best.pth")
+
+
+def config_digest(args, name, kind):
+    payload = {k: getattr(args, k) for k in (
+        "qubits", "quantum_layers", "image_size", "seed", "train_samples", "val_fraction",
+        "head_epochs", "finetune_epochs", "head_lr", "backbone_lr",
+        "head_finetune_lr", "batch_size", "weight_decay", "pretrained_weights",
+        "no_augmentation")}
+    payload.update({"dataset": name, "kind": kind})
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def save_checkpoint(path, model, optimizer, metadata):
+    temp = path.with_suffix(".tmp")
+    torch.save({**metadata, "state_dict": model.state_dict(),
+                "optimizer_state": optimizer.state_dict() if optimizer is not None else None}, temp)
+    os.replace(temp, path)
+
+
+def load_checkpoint(path, device, digest):
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    if ckpt.get("config_digest") != digest:
+        raise RuntimeError(f"Checkpoint configuration mismatch: {path}. "
+                           "Use a separate checkpoint directory or consistent flags.")
+    return ckpt
+
+
+def fit_model(name, kind, args, train_dl, val_dl, device):
+    n_classes = DATASET_SPEC[name][0]
+    last_path, best_path = checkpoint_paths(name, kind, args)
+    digest = config_digest(args, name, kind)
+    model, head = build_model(kind, n_classes, args)
+    model.to(device)
+    stages = [("head", args.head_epochs), ("finetune", args.finetune_epochs)]
+    total_steps = sum(n for _, n in stages)
+    start = 0
+    best_val = -1.0
+    resume = None
+    if last_path.is_file():
+        resume = load_checkpoint(last_path, device, digest)
+        model.load_state_dict(resume["state_dict"], strict=True)
+        start = int(resume["completed_epochs"])
+        best_val = float(resume.get("best_val_accuracy", -1.0))
+        if start >= total_steps:
+            print(f"Already trained {name}/{kind}: {start}/{total_steps} epochs; loading best")
+    elif args.eval_only and not best_path.is_file():
+        raise FileNotFoundError(f"No saved checkpoint for evaluation: {best_path}")
+    if not args.eval_only and start < total_steps:
+        for global_epoch in range(start, total_steps):
+            stage = "head" if global_epoch < args.head_epochs else "finetune"
+            stage_index = global_epoch if stage == "head" else global_epoch - args.head_epochs
+            # Initializing an optimizer per stage is deliberate; restore it on resume mid-stage.
+            if global_epoch == start or stage_index == 0:
+                optimizer = optimizer_for_stage(model, head, stage, args)
+                if resume is not None and global_epoch == start and stage_index > 0:
+                    if resume.get("optimizer_state") is not None:
+                        optimizer.load_state_dict(resume["optimizer_state"])
+            train_loss, train_acc = train_epoch(model, head, train_dl, optimizer, stage, n_classes, device)
+            val_loss, val_acc = validation_epoch(model, val_dl, n_classes, device)
+            if val_acc > best_val:
+                best_val = val_acc
+                save_checkpoint(best_path, model, None, {
+                    "dataset": name, "kind": kind, "qubits": args.qubits,
+                    "n_classes": n_classes, "config_digest": digest,
+                    "selected_epoch": global_epoch + 1, "best_val_accuracy": best_val,
+                    "pretrained_weights": args.pretrained_weights,
+                    "train_count": len(train_dl.dataset), "val_count": len(val_dl.dataset),
+                })
+            save_checkpoint(last_path, model, optimizer, {
+                "dataset": name, "kind": kind, "qubits": args.qubits,
+                "n_classes": n_classes, "config_digest": digest,
+                "completed_epochs": global_epoch + 1, "total_epochs": total_steps,
+                "stage": stage, "best_val_accuracy": best_val,
+                "pretrained_weights": args.pretrained_weights,
+                "train_count": len(train_dl.dataset), "val_count": len(val_dl.dataset),
+            })
+            print(f"{name}/{kind} epoch={global_epoch + 1}/{total_steps} stage={stage}: "
+                  f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, "
+                  f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, best_val_acc={best_val:.4f}")
+    if not best_path.is_file():
+        raise FileNotFoundError(f"Best checkpoint missing: {best_path}")
+    best = load_checkpoint(best_path, device, digest)
+    model.load_state_dict(best["state_dict"], strict=True)
+    model.eval()
+    return model, best_path, best
+
+
+@torch.no_grad()
+def evaluate_test(name, kind, model, best_path, best, test_dl, official_test_len, args, device):
+    model.eval()
+    n_classes = DATASET_SPEC[name][0]
+    true, pred, records = [], [], []
+    index = 0
+    for images, targets in tqdm(test_dl, desc=f"TEST {name}/{kind}", leave=False):
+        images = images.to(device)
+        logits = logits_from_forward(model(images), n_classes)
+        prob = logits.float().softmax(dim=1)
+        predicted = logits.argmax(dim=1).cpu().tolist()
+        confidence = prob.max(dim=1).values.cpu().tolist()
+        for gt, p, conf in zip(targets.tolist(), predicted, confidence):
+            true.append(int(gt))
+            pred.append(int(p))
+            records.append({"sample_index": index, "true_label": int(gt),
+                            "prediction": int(p), "correct": int(gt == p),
+                            "confidence": float(conf)})
+            index += 1
+    output = args.output_dir
+    basename = best_path.stem.removesuffix("_best")
+    pred_path = output / "predictions" / f"{basename}_predictions.csv"
+    confusion_path = output / "confusion_matrices" / f"{basename}_confusion_matrix.csv"
+    pd.DataFrame(records).to_csv(pred_path, index=False)
+    pd.DataFrame(confusion_matrix(true, pred, labels=range(n_classes)),
+                 index=range(n_classes), columns=range(n_classes)).to_csv(confusion_path, index_label="true\\pred")
+    labels = list(range(n_classes))
+    metrics = {
+        "dataset": name, "model": kind, "n_classes": n_classes,
+        "n_qubits_or_bottleneck": args.qubits if kind != "classical_standard" else None,
+        "quantum_layers": args.quantum_layers if kind == "quantum" else 0,
+        "selected_epoch": best.get("selected_epoch"),
+        "best_validation_accuracy": best.get("best_val_accuracy"),
+        "train_samples": best.get("train_count"), "validation_samples": best.get("val_count"),
+        "test_samples": len(true), "official_test_samples": official_test_len,
+        "full_test_set": len(true) == official_test_len,
+        "correct_predictions": sum(int(a == b) for a, b in zip(true, pred)),
+        "accuracy": accuracy_score(true, pred),
+        "balanced_accuracy": balanced_accuracy_score(true, pred),
+        "precision_macro": precision_score(true, pred, labels=labels, average="macro", zero_division=0),
+        "recall_macro": recall_score(true, pred, labels=labels, average="macro", zero_division=0),
+        "f1_macro": f1_score(true, pred, labels=labels, average="macro", zero_division=0),
+        "precision_weighted": precision_score(true, pred, labels=labels, average="weighted", zero_division=0),
+        "recall_weighted": recall_score(true, pred, labels=labels, average="weighted", zero_division=0),
+        "f1_weighted": f1_score(true, pred, labels=labels, average="weighted", zero_division=0),
+        "checkpoint": str(best_path), "predictions_csv": str(pred_path),
+        "confusion_matrix_csv": str(confusion_path),
     }
+    print(f"RESULT {name}/{kind}: accuracy={metrics['accuracy']:.4f} "
+          f"balanced={metrics['balanced_accuracy']:.4f} F1-macro={metrics['f1_macro']:.4f} "
+          f"({len(true)} test images)")
+    return metrics
 
-
-def append_single_row(row, output_path):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    exists=output_path.exists()
-    pd.DataFrame([row]).to_csv(output_path,mode="a" if exists else "w",header=not exists,index=False)
-
-
-def backfill_final_metrics(output_path, metrics):
-    df=pd.read_csv(output_path)
-    df["model_accuracy"]=float(metrics["accuracy"])
-    df["model_precision_weighted"]=float(metrics["precision_weighted"])
-    df["model_recall_weighted"]=float(metrics["recall_weighted"])
-    df["model_f1_weighted"]=float(metrics["f1_weighted"])
-    df.to_csv(output_path,index=False)
-
-
-
-
-# ============================================================
-# TEST / RESUME, preserves all telemetry columns from uploaded code
-# ============================================================
-def backfill_from_csv(output_path,n_classes):
- df=pd.read_csv(output_path)
- if df.empty: return
- good=df.dropna(subset=['true_label','prediction'])
- if good.empty: return
- yt=good.true_label.astype(int).to_numpy(); yp=good.prediction.astype(int).to_numpy()
- metrics={'accuracy':accuracy_score(yt,yp),
-          'precision_weighted':precision_score(yt,yp,labels=list(range(n_classes)),average='weighted',zero_division=0),
-          'recall_weighted':recall_score(yt,yp,labels=list(range(n_classes)),average='weighted',zero_division=0),
-          'f1_weighted':f1_score(yt,yp,labels=list(range(n_classes)),average='weighted',zero_division=0)}
- for key,value in [('model_accuracy','accuracy'),('model_precision_weighted','precision_weighted'),('model_recall_weighted','recall_weighted'),('model_f1_weighted','f1_weighted')]: df[key]=float(metrics[value])
- df.to_csv(output_path,index=False)
- print('Metrics:',metrics)
-
-def test_model(name,key,n_classes,model,test_loader,path):
- model.eval()
- label=f'HybridYOLO26n-{N_QUBITS}Q'
- out=DEVICE_LOG_DIR/f'yolo26n_{key}_{N_QUBITS}qubit_{IMG_SIZE}px_{path.stem.split("_")[-2]}_v3_test_telemetry.csv'
- # Skip rows by stable test-set sample index, not row counts.
- done=set()
- if out.is_file():
-  df=pd.read_csv(out)
-  if not {'sample_index','model_type'}.issubset(df.columns):
-   raise RuntimeError(f'Existing telemetry schema mismatch: {out}')
-  done=set(df.loc[df.model_type==label,'sample_index'].dropna().astype(int))
- param_count=sum(p.numel() for p in model.parameters())
- i=0
- for x,y in tqdm(test_loader,desc=f'{name} telemetry'):
-  for k in range(len(y)):
-   idx=i;i+=1
-   if idx in done: continue
-   one=x[k:k+1].to(DEVICE)
-   label_true=int(y[k])
-   with torch.no_grad():
-    (logits,elapsed,cpu_e,gpu_e,ram_e,total_e,emission,ci,gpu)=run_single_inference_with_telemetry(model,one,key)
-   predicted=int(logits.argmax(dim=1).item())
-   row=build_telemetry_row(model_name=label,prediction=predicted,exec_time=elapsed,
-    parameters=param_count,true_label=label_true,sample_index=idx,logits=logits,
-    cpu_energy=cpu_e,gpu_energy=gpu_e,ram_energy=ram_e,total_energy=total_e,
-    emissions_value=emission,carbon_intensity=ci,gpu_metrics=gpu,model_flops=None,
-    quantum_computing=True,dataset_name=name,sample_id=idx,checkpoint_path=path)
-   append_single_row(row,out)
-   done.add(idx)
- if out.is_file():
-  backfill_from_csv(out,n_classes)
-  print('Saved:',out)
 
 def main():
- print('Hybrid YOLO26n + 4-layer simulated VQC',N_QUBITS,'qubits; device:',DEVICE)
- for name in SELECTED_DATASETS:
-  global ACTIVE_CLASSES
-  _,key,n_classes=DATASET_CONFIGS[name]
-  ACTIVE_CLASSES=n_classes
-  print('\n======',name,'classes',n_classes,'======')
-  train_loader,val_loader,test_loader=make_loaders(name)
-  model,path=load_or_train(name,key,n_classes,train_loader,val_loader)
-  test_model(name,key,n_classes,model,test_loader,path)
-  del model
- print('Done')
+    args = parse_arguments()
+    seed_everything(args.seed)
+    device = get_device(args)
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "predictions").mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "confusion_matrices").mkdir(parents=True, exist_ok=True)
+    print("Pretrained Hybrid YOLO26n-CLS / PennyLane statevector simulation")
+    print(f"Device={device}; models={args.models}; datasets={args.datasets}")
+    print(f"Stages: frozen-head {args.head_epochs} epochs + fine-tune {args.finetune_epochs} epochs")
+    print("Architecture: 5-qubit variational circuit (default), 4 layers with data re-uploading")
+    print("Note: simulated quantum model on CPU; it may be very slow on full CIFAR-100/Tiny ImageNet")
+    results = []
+    errors = []
+    for name in args.datasets:
+        try:
+            train_dl, val_dl, test_dl, original_train, original_test = dataset_loaders(name, args)
+        except Exception as e:
+            print(f"DATASET FAILED {name}: {e}")
+            errors.append({"dataset": name, "model": "ALL", "reason": str(e)})
+            continue
+        for kind in args.models:
+            model = None
+            try:
+                # Re-seed before each initial model for reproducible head initialization.
+                seed_everything(args.seed)
+                model, path, best = fit_model(name, kind, args, train_dl, val_dl, device)
+                result = evaluate_test(name, kind, model, path, best, test_dl, original_test, args, device)
+                results.append(result)
+                pd.DataFrame(results).to_csv(args.output_dir / "model_accuracy_summary.csv", index=False)
+            except Exception as e:
+                print(f"FAILED {name}/{kind}: {type(e).__name__}: {e}")
+                errors.append({"dataset": name, "model": kind, "reason": f"{type(e).__name__}: {e}"})
+                pd.DataFrame(errors).to_csv(args.output_dir / "failures.csv", index=False)
+            finally:
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    if results:
+        print(f"\nSaved {len(results)} results: {args.output_dir / 'model_accuracy_summary.csv'}")
+    if errors:
+        print(f"Some experiments failed: {args.output_dir / 'failures.csv'}")
 
-if __name__=='__main__': main()
+
+if __name__ == "__main__":
+    main()
