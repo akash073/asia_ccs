@@ -59,12 +59,13 @@ except ImportError as exc:
     ) from exc
 
 DATASET_SPEC = {
+    "CIFAR10": (10, "cifar10"),
     "MNIST": (10, "mnist"),
     "FashionMNIST": (10, "fashionmnist"),
     "KMNIST": (10, "kmnist"),
-    "CIFAR10": (10, "cifar10"),
-    "CIFAR100": (100, "cifar100"),
-    "TinyImageNet200": (200, "tinyimagenet200"),
+    
+    #"CIFAR100": (100, "cifar100"),
+    #"TinyImageNet200": (200, "tinyimagenet200"),
 }
 MODEL_KINDS = ("quantum", "classical_bottleneck", "classical_standard")
 
@@ -76,14 +77,14 @@ def parse_arguments():
                         default=["quantum", "classical_bottleneck", "classical_standard"])
     parser.add_argument("--data-root", type=Path, default=Path("./data"))
     parser.add_argument("--tiny-root", type=Path, default=None)
-    parser.add_argument("--checkpoint-dir", type=Path, default=Path("quantum_checkpoints/pretrained_10q"))
-    parser.add_argument("--output-dir", type=Path, default=Path("evaluation_results/pretrained_10q"))
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("quantum_checkpoints/pretrained_5q"))
+    parser.add_argument("--output-dir", type=Path, default=Path("evaluation_results/pretrained_5q"))
     parser.add_argument("--pretrained-weights", default="yolo26n-cls.pt")
     parser.add_argument("--image-size", type=int, default=224,
                         help="Pretrained model's standard classification resolution; same for all models")
-    parser.add_argument("--qubits", type=int, default=10)
+    parser.add_argument("--qubits", type=int, default=5)
     parser.add_argument("--quantum-layers", type=int, default=4)
-    parser.add_argument("--head-epochs", type=int, default=10)
+    parser.add_argument("--head-epochs", type=int, default=5)
     parser.add_argument("--finetune-epochs", type=int, default=30)
     parser.add_argument("--head-lr", type=float, default=1e-3)
     parser.add_argument("--backbone-lr", type=float, default=1e-5)
